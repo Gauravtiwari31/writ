@@ -196,6 +196,9 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@simplewebauthn/server':
+        specifier: ^14.0.3
+        version: 14.0.3
       '@writ/core':
         specifier: workspace:*
         version: link:../../packages/core

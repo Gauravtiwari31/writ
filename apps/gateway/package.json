@@ -13,6 +13,7 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^14.0.3",
     "@writ/core": "workspace:*",
     "@writ/ledger": "workspace:*",
     "@writ/paypal": "workspace:*",
