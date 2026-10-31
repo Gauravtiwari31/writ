@@ -1,0 +1,19 @@
+{
+  "name": "@writ/paypal",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Typed PayPal sandbox client: OAuth, Orders v2, Payments v2, Vault v3, Webhooks, Disputes, Tracking. The only package allowed to move money (§22 rule 8).",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@writ/core": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}

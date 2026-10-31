@@ -1,0 +1,29 @@
+{
+  "name": "@writ/gateway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Writ Gateway: REST API, PayPal webhooks, decision pipeline, payment saga, MCP endpoint.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "db:generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@writ/core": "workspace:*",
+    "@writ/ledger": "workspace:*",
+    "@writ/paypal": "workspace:*",
+    "drizzle-orm": "^0.45.4",
+    "fastify": "^5.12.7",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.0",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11"
+  }
+}

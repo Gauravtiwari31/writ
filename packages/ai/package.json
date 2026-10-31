@@ -1,0 +1,23 @@
+{
+  "name": "@writ/ai",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Model router, prompts and typed AI roles (compiler, reader, sentinel, verifier, analyst, agents).",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^4.0.0",
+    "@ai-sdk/groq": "^4.0.0",
+    "@openrouter/ai-sdk-provider": "^3.1.0",
+    "@writ/core": "workspace:*",
+    "ai": "^7.0.0",
+    "zod": "^4.6.7"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@writ/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Day-1 kill-risk spikes (plan §17), seed and smoke scripts. Run from the repo root with `pnpm spike <file>.ts`.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^14.0.3",
+    "@writ/ai": "workspace:*",
+    "@writ/core": "workspace:*",
+    "@writ/paypal": "workspace:*",
+    "fastify": "^5.12.7",
+    "zod": "^4.6.7"
+  }
+}

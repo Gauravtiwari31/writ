@@ -1,0 +1,19 @@
+{
+  "name": "@writ/ledger",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Hash-chained evidence ledger and evidence pack builder.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@writ/core": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}
