@@ -11,3 +11,6 @@ export * from "./cart";
 // (verifyWebAuthnOverHash, verifyWritSignature) lives on the "@writ/core/signatures" subpath.
 export * from "./signatures/schema";
 export * from "./signatures/device";
+// Decision pipeline: verdicts and LLM contracts, the deterministic policy engine, the combiner.
+export * from "./verdicts";
+export * from "./policy/index";
