@@ -85,7 +85,12 @@ export const cart: JsonValue = {
 };
 
 export function policyDecision(path: Path): JsonValue {
-  return { verdict: path === "auto-capture" ? "APPROVE" : "REVIEW", reasons: path === "auto-capture" ? [] : ["AMOUNT_ABOVE_HUMAN_THRESHOLD"] };
+  // amount_minor: the computed total the policy approved, as in @writ/core's PolicyDecision.
+  return {
+    verdict: path === "auto-capture" ? "APPROVE" : "REVIEW",
+    amount_minor: "4400",
+    reasons: path === "auto-capture" ? [] : ["AMOUNT_ABOVE_HUMAN_THRESHOLD"],
+  };
 }
 
 export function verifierRecord(path: Path): JsonValue | null {

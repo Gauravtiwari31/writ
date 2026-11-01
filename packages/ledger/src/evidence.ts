@@ -118,6 +118,7 @@ export const VERIFICATION_INSTRUCTIONS: readonly string[] = [
   "Ledger: each event's hash = SHA-256(prev_hash ‖ u32be(len) ‖ type ‖ u32be(len) ‖ JCS(payload) ‖ u32be(len) ‖ ts), text as UTF-8, prev_hash as 32 raw bytes; the first event is WRIT_SIGNED with prev_hash = 32 zero bytes and each later prev_hash equals the previous hash.",
   "The WRIT_SIGNED payload.writ_hash must equal writ.hash; the PAYPAL_* events for purchase.purchase_id must carry the PayPal IDs, custom_id, invoice_id and amount shown above.",
   "The PAYPAL_ORDER_CREATED event records the full c_pre, and every PAYPAL_CAPTURED or PAYPAL_VOIDED event records the full c_post (null when voided before the verifier ran); both must equal commitments.c_pre and commitments.c_post.",
+  "cart.total_minor and policy_decision.amount_minor must both equal purchase.amount_minor, and cart.currency must equal purchase.currency: PayPal was asked for exactly the committed, policy-checked total.",
   "verifyEvidencePack() in the Writ repository (packages/ledger) performs every check above offline, except the comparison with PayPal's own order and capture records.",
 ];
 
@@ -242,6 +243,7 @@ export const EVIDENCE_CHECK_NAMES = [
   "paypal_anchors",
   "ledger_commitments",
   "paypal_amounts",
+  "committed_amount",
   "debug_ids",
 ] as const;
 export type EvidenceCheckName = (typeof EVIDENCE_CHECK_NAMES)[number];
@@ -474,6 +476,29 @@ function paypalAmountsCheck(pack: EvidencePack, mine: readonly Located[]): Evide
     : failed("paypal_amounts", problems.join("; "));
 }
 
+function memberOf(doc: JsonValue, key: string): JsonValue | undefined {
+  return typeof doc === "object" && doc !== null && !Array.isArray(doc) && Object.hasOwn(doc, key) ? doc[key] : undefined;
+}
+
+/**
+ * paypal_amounts ties the ledger's PayPal amounts to purchase.amount_minor; this ties that amount
+ * to the documents inside C_pre (H_c, H_p), so capture amount = committed total is checkable (§22 rule 11).
+ */
+function committedAmountCheck(pack: EvidencePack): EvidenceCheck {
+  const { amount_minor: amount, currency } = pack.purchase;
+  const claims: [string, JsonValue | undefined, string][] = [
+    ["cart.total_minor", memberOf(pack.cart, "total_minor"), amount],
+    ["cart.currency", memberOf(pack.cart, "currency"), currency],
+    ["policy_decision.amount_minor", memberOf(pack.policy_decision, "amount_minor"), amount],
+  ];
+  const problems = claims
+    .filter(([, value, want]) => value !== want)
+    .map(([label, value, want]) => `${label} is ${JSON.stringify(value ?? null)}, PayPal was asked for ${want}`);
+  return problems.length === 0
+    ? pass("committed_amount", `cart and policy decision commit to ${amount} ${currency} (minor units)`)
+    : failed("committed_amount", problems.join("; "));
+}
+
 function debugIdsCheck(pack: EvidencePack, mine: readonly Located[]): EvidenceCheck {
   const recorded = debugIdsOf(mine);
   const listed = pack.purchase.paypal.debug_ids;
@@ -530,6 +555,7 @@ export async function verifyEvidencePack(input: unknown, options: VerifyEvidence
   checks.push(paypalAnchorsCheck(pack, mine));
   checks.push(ledgerCommitmentsCheck(pack, mine));
   checks.push(paypalAmountsCheck(pack, mine));
+  checks.push(committedAmountCheck(pack));
   checks.push(debugIdsCheck(pack, mine));
 
   return { ok: checks.every((check) => check.status !== "FAIL"), checks };

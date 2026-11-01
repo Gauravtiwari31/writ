@@ -237,8 +237,13 @@ describe("verifyEvidencePack", () => {
     ["commitments.c_post → null", (p) => void (p.commitments.c_post = null), ["c_post", "invoice_id", "ledger_commitments"]],
     ["commitments.invoice_id", (p) => void (p.commitments.invoice_id = `wv-${"0".repeat(40)}`), ["invoice_id", "paypal_anchors"]],
     ["commitments.invoice_id → null", (p) => void (p.commitments.invoice_id = null), ["paypal_anchors"]],
-    ["cart", (p) => void ((p.cart as JsonObject)["total_minor"] = "440"), ["h_c"]],
+    ["cart", (p) => void ((p.cart as JsonObject)["ship_to_ref"] = "addr_gift_wrap_newark"), ["h_c"]],
+    ["cart.total_minor", (p) => void ((p.cart as JsonObject)["total_minor"] = "440"), ["committed_amount", "h_c"]],
+    ["cart.currency", (p) => void ((p.cart as JsonObject)["currency"] = "EUR"), ["committed_amount", "h_c"]],
+    ["cart → not an object", (p) => void (p.cart = "4400"), ["committed_amount", "h_c"]],
     ["policy_decision", (p) => void ((p.policy_decision as JsonObject)["verdict"] = "APPROVE"), ["h_p"]],
+    ["policy_decision.amount_minor", (p) => void ((p.policy_decision as JsonObject)["amount_minor"] = "19900"), ["committed_amount", "h_p"]],
+    ["policy_decision.amount_minor (deleted)", (p) => void delete (p.policy_decision as JsonObject)["amount_minor"], ["committed_amount", "h_p"]],
     ["verifier", (p) => void ((p.verifier as JsonObject)["confidence"] = 0.99), ["h_verifier"]],
     ["verifier → null", (p) => void (p.verifier = null), ["h_verifier"]],
     ["approval", (p) => void ((p.approval as JsonObject)["decision"] = "DECLINE"), ["h_approval"]],
@@ -275,7 +280,7 @@ describe("verifyEvidencePack", () => {
     ["purchase.paypal.capture_id", (p) => void (p.purchase.paypal.capture_id = "7ZZ00000000000000"), ["paypal_ids"]],
     ["purchase.paypal.capture_id → null", (p) => void (p.purchase.paypal.capture_id = null), ["paypal_ids"]],
     ["purchase.paypal.void_id (added)", (p) => void (p.purchase.paypal.void_id = "VOID1"), ["paypal_ids"]],
-    ["purchase.amount_minor", (p) => void (p.purchase.amount_minor = "4401"), ["paypal_amounts"]],
+    ["purchase.amount_minor", (p) => void (p.purchase.amount_minor = "4401"), ["committed_amount", "paypal_amounts"]],
     ["purchase.paypal.debug_ids", (p) => void p.purchase.paypal.debug_ids.pop(), ["debug_ids"]],
   ])("fails exactly the checks that cover %s", async (_field, fn, expected) => {
     expect(await failing(mutate(fn))).toEqual(expected);
@@ -378,10 +383,8 @@ describe("verifyEvidencePack", () => {
     expect(await failing({ ...base, events: [...base.events, foreign] })).toEqual(["paypal_ids"]);
   });
 
-  it("is internally consistent after a wholesale re-forgery, which is why writ-verify must also compare custom_id/invoice_id with PayPal", async () => {
-    // An attacker who controls the whole pack can swap the cart and recompute everything except the
-    // Writ signature (the Writ is unchanged) and the PayPal record, which still holds the original anchors.
-    const forgedCart = { ...(cart as JsonObject), total_minor: "9900" };
+  /** Swaps the cart and recomputes every commitment, anchor and ledger hash from it. */
+  function reforgeWithCart(forgedCart: JsonObject): EvidencePack {
     const { input } = recordPurchase("review-capture");
     const cPre = commitPre(hashJcs(writBody), hashJcs(forgedCart), hashJcs(input.policy_decision));
     const cPost = commitPost(cPre, hashJcs(input.verifier), hashJcs(input.approval));
@@ -390,9 +393,23 @@ describe("verifyEvidencePack", () => {
       if (event.type === "PAYPAL_CAPTURED") return { ...event.payload, invoice_id: toInvoiceId(cPost), c_post: toHex(cPost) };
       return event.payload;
     });
-    const forged = buildEvidencePack({ ...input, cart: forgedCart, events });
+    return buildEvidencePack({ ...input, cart: forgedCart, events });
+  }
+
+  it("is internally consistent after a wholesale re-forgery, which is why writ-verify must also compare custom_id/invoice_id with PayPal", async () => {
+    // An attacker who controls the whole pack can swap the cart and recompute everything except the
+    // Writ signature (the Writ is unchanged) and the PayPal record, which still holds the original anchors.
+    const forgedCart = { ...(cart as JsonObject), ship_to_ref: "addr_gift_wrap_newark" };
+    const forged = reforgeWithCart(forgedCart);
     expect(await failing(forged)).toEqual([]);
     expect(forged.commitments.custom_id).not.toBe(base.commitments.custom_id);
     expect(forged.commitments.invoice_id).not.toBe(base.commitments.invoice_id);
+  });
+
+  it("catches a re-forged cart whose committed total differs from what PayPal moved (threat T4)", async () => {
+    const forged = reforgeWithCart({ ...(cart as JsonObject), total_minor: "9900" });
+    expect(await failing(forged)).toEqual(["committed_amount"]);
+    const check = (await verifyEvidencePack(forged, withSignature)).checks.find((c) => c.name === "committed_amount");
+    expect(check?.detail).toBe('cart.total_minor is "9900", PayPal was asked for 4400');
   });
 });
