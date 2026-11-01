@@ -1,0 +1,63 @@
+# Render Blueprint for Writ (plan §14 and §22 rules 32-33). Reference: https://render.com/docs/blueprint-spec
+#
+# Paid instances only. A Free web service sleeps after 15 minutes idle, and a Free Render Postgres
+# database EXPIRES 30 DAYS AFTER CREATION (then is deleted after a 14-day grace period), which is
+# before judging ends on Dec 15. Free Postgres is forbidden here (§22 rule 33): never set plan: free.
+#
+# Secrets use sync: false, so Render asks for them when the Blueprint is first applied and they never
+# live in git (§22 rule 20). Sandbox only: PAYPAL_ENV is pinned to "sandbox" and the gateway refuses
+# to start with anything else (§22 rule 21).
+
+services:
+  - type: web
+    name: writ-gateway
+    runtime: node
+    # 0.5 CPU / 512 MB, the paid plan formerly called Starter (plan IDs per the Blueprint spec).
+    plan: 0.5c-512mb
+    region: oregon
+    branch: main
+    # Node 25+ no longer bundles Corepack, so install it explicitly, then let packageManager in
+    # package.json pick the pnpm version. Dev dependencies are needed at runtime (tsx runs the
+    # TypeScript sources), so NODE_ENV must not be "production" during the build.
+    buildCommand: npm install -g corepack && corepack enable && pnpm install --frozen-lockfile
+    startCommand: pnpm --filter @writ/gateway start
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      # Render's default for new services is Node 24; the repo targets Node 22 (engines >=22.12).
+      - key: NODE_VERSION
+        value: "22"
+      - key: PAYPAL_ENV
+        value: sandbox
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      # Printed by: pnpm spike spike-webhooks.ts register --url https://<service>.onrender.com/v1/webhooks/paypal
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+      # The onrender.com host of this service (no scheme), for the S6 passkey spike.
+      - key: WEBAUTHN_RP_ID
+        sync: false
+      - key: WEBAUTHN_RP_NAME
+        value: Writ
+      # Day-1 spikes (S3 status, S6 passkey) need the Render domain. Set to "false" once G0 is closed.
+      - key: ENABLE_SPIKES
+        value: "true"
+      - key: LOG_LEVEL
+        value: info
+      - key: DATABASE_URL
+        fromDatabase:
+          name: writ-db
+          property: connectionString
+
+databases:
+  - name: writ-db
+    # Smallest PAID plan (0.1 CPU / 256 MB). Never "free": it expires after 30 days.
+    plan: 0.1c-256mb
+    region: oregon
+    postgresMajorVersion: "18"
+    databaseName: writ
+    user: writ
+    # Private network only: the gateway connects internally; nothing outside Render can reach it.
+    ipAllowList: []

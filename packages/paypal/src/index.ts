@@ -7,3 +7,5 @@ export * from "./schemas";
 export * from "./orders";
 export * from "./payments";
 export * from "./vault";
+export * from "./webhooks";
+export * from "./disputes";
