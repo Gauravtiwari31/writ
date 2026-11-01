@@ -255,11 +255,11 @@ flowchart LR
 ```
 
 ### 6.2 Decision pipeline (ordered, fail-closed)
-1. **Schema** — Zod-parse the cart; reject unknown fields.
+1. **Schema** — Zod-parse the cart; reject unknown fields. Contract: `CartSchema` (`writ-cart/0.1`, `packages/core/src/cart.ts`), strict, no payee field anywhere; the declared `total_minor` must equal Σ unit×qty + shipping + tax (bigint) and each `product_ref` appears on one line only.
 2. **Writ validity** — signature verifies, status ACTIVE, not expired/revoked, the agent is bound to this Writ.
 3. **Deterministic policy** (pure function, `packages/core/policy`):
    - `cart.total ≤ max_per_order`; `orders_count < max_orders`
-   - categories checked against our **fixed taxonomy codes** (never free text)
+   - categories checked against our **fixed taxonomy codes** (never free text): 16 parents / 45 leaves in `packages/core/src/taxonomy.ts`; cart items carry a leaf, a Writ may allow a parent (all its leaves) or individual leaves
    - merchant allow/deny; payee is always the merchant of record — agents cannot name payees
    - `ship_to_ref` must equal the Writ's when locked
    - ETA ≤ `deliver_by` (if set)
@@ -270,7 +270,7 @@ flowchart LR
 5. **AUTHORIZE** on PayPal (funds held) with the pre-commitment in `custom_id`.
 6. **Sentinel** scans every tainted input that influenced the cart (pages, titles, descriptions).
 7. **Verifier** judges semantic fit using typed fields only (§8.5).
-8. **Combiner** — `final = max(policy, threshold, sentinel, verifier)` with BLOCK > REVIEW > APPROVE. An LLM can move a decision **up, never down**. Verifier timeout/parse failure → REVIEW.
+8. **Combiner** — `final = max(policy, threshold, sentinel, verifier)` with BLOCK > REVIEW > APPROVE. An LLM can move a decision **up, never down**. Verifier timeout/parse failure → REVIEW. The combiner re-validates its inputs: a malformed or inconsistent policy decision → BLOCK; the verifier answer must judge exactly the cart's lines (`cart_product_refs`; a skipped or invented line → REVIEW); a null or malformed signal → REVIEW.
 9. **Execute** — APPROVE → capture · REVIEW → human passkey → capture or void · BLOCK → void. Convert or release the reservation.
 
 ### 6.3 Purchase state machine
@@ -350,7 +350,7 @@ sequenceDiagram
   D->>A: typed facts + datamarked buyer messages
   A-->>D: liability, action, note, confidence
   alt user-authorized or fulfilled
-    D->>PP: POST /provide-evidence (multipart JSON + evidence.pdf)
+    D->>PP: POST /provide-evidence (multipart: input JSON + file1 PDF)
   else platform error
     D->>PP: POST /accept-claim (REFUND)
   end
@@ -366,25 +366,34 @@ paypal_vault_tokens(id, user_id, vault_id, paypal_customer_id, status)
 address_book(id, user_id, label, line1, city, region, postal, country)  -- agents only ever see id + label
 agents(id, user_id, name, kind IN ('builtin','mcp','sdk'), api_key_hash, revoked_at)
 writs(id, user_id, agent_id, body JSONB, body_hash BYTEA, signature JSONB, status, expires_at)
+                                   -- body = WritBody (writ/0.1, every key present, explicit nulls); body_hash = sha256(JCS(body))
+                                   -- = WebAuthn challenge; status CHECK IN (DRAFT, ACTIVE, REVOKED, EXPIRED)
 writ_budgets(writ_id PK, limit_minor BIGINT, max_per_order_minor BIGINT, reserved_minor BIGINT,
              spent_minor BIGINT, orders_count INT, max_orders INT, version INT)
-carts(id, writ_id, agent_id, body JSONB, body_hash BYTEA, sources JSONB)   -- sources = tainted inputs
+                                   -- CHECK reserved >= 0, spent >= 0, spent + reserved <= limit, 0 <= orders_count <= max_orders
+carts(id, writ_id, agent_id, body JSONB, body_hash BYTEA, sources JSONB)   -- sources = tainted inputs: CartSource[] <= 50
+                                   -- {url, kind: page|search_result|listing, fetched_at, product_ref|null}; not part of H_c
 decisions(id, cart_id, stage, verdict, reasons JSONB, model, latency_ms, tokens)
 purchases(id, writ_id, cart_id, agent_id, state, amount_minor BIGINT, currency, idempotency_key,
-          paypal_order_id, authorization_id, capture_id, refund_id, c_pre BYTEA, c_post BYTEA)
+          paypal_order_id UNIQUE, authorization_id UNIQUE, capture_id UNIQUE, refund_id UNIQUE,
+          c_pre BYTEA, c_post BYTEA, updated_at)   -- UNIQUE(agent_id, idempotency_key) (T7); CHECK state IN the §6.3 states;
+                                   -- updated_at lets the recovery job find stuck sagas
 approvals(id, purchase_id, status, expires_at, assertion JSONB, decided_at)
-ledger_events(seq BIGSERIAL, purchase_id, writ_id, type, payload JSONB, prev_hash BYTEA, hash BYTEA)
+ledger_events(seq BIGSERIAL, purchase_id NULL, writ_id, type, payload JSONB, ts TEXT, prev_hash BYTEA, hash BYTEA UNIQUE)
+                                   -- UNIQUE(writ_id, prev_hash): a chain cannot fork; ts = the exact hashed ISO string
 disputes(id, paypal_dispute_id UNIQUE, purchase_id, reason, status, stage, analysis JSONB, action, outcome)
 webhook_events(paypal_event_id PK, type, payload JSONB, verified BOOL, processed_at)
 attacks(id, source_url, category, spans JSONB, cart_id, agent_id)
 outbox(id, topic, payload JSONB, published_at)
 ```
+- Primary keys are `@writ/core` ULID ids (`<prefix>_<26 base32>`). Rows a signed document can reference use core prefixes (`usr`, `adr`, `agt`, `wr`, `crt`, `pur`, `apr`); gateway-only rows use `psk`, `dvk`, `vlt`, `dec`, `dsp`, `atk`, `obx`. Exceptions: `ledger_events.seq`, `webhook_events.paypal_event_id`.
+- Every hash/key `bytea` column has CHECK `octet_length = 32`. Schema: `apps/gateway/src/db/schema.ts`; migrations in `apps/gateway/drizzle/`.
 
 ### 6.6 Gateway API
 | Method & path | Caller | Purpose |
 |---|---|---|
 | `POST /v1/writs/compile` | Wallet | text → WritDraft + clarifying questions |
-| `POST /v1/writs` | Wallet | store draft → canonical body + hash (= WebAuthn challenge) |
+| `POST /v1/writs` | Wallet | store draft (server-generated id) → canonical body + hash (= WebAuthn challenge, single-use, consumed by `/sign`) |
 | `POST /v1/writs/:id/sign` | Wallet | WebAuthn assertion → ACTIVE |
 | `POST /v1/writs/:id/revoke`, `POST /v1/kill-switch` | Wallet | revoke one / all (+ void in-flight authorizations) |
 | `POST /v1/paypal/vault/*` | Wallet | connect PayPal (exact endpoints decided in S1) |
@@ -402,13 +411,18 @@ outbox(id, topic, payload JSONB, published_at)
 | `/mcp` | MCP clients | writ-mcp |
 | `GET /.well-known/writ-jwks.json` | Anyone | gateway attestation keys (P1-7) |
 
+**Passkeys and hosts (found in S6 prep).** `onrender.com` is on the Public Suffix List, so `writ-web.onrender.com` and `writ-gateway.onrender.com` cannot share a parent RP ID and a passkey made on one cannot be used on the other. WebAuthn ceremonies run on the Wallet origin (`APP_BASE_URL`, RP ID = Wallet host); the gateway only verifies, with `expectedOrigin = APP_BASE_URL` and `expectedRPID = WEBAUTHN_RP_ID`. The challenge is the 32 raw bytes of the hash (`@simplewebauthn/server` UTF-8-encodes string challenges), verified with `expectedChallenge = base64url(hash)` and `requireUserVerification: true`. Verification lives on the `@writ/core/signatures` subpath so the Wallet bundle never pulls in server code.
+
 ### 6.7 Evidence and PayPal anchoring
 - `H_w = sha256(JCS(writ))`, `H_c = sha256(JCS(cart))`, `H_p = sha256(JCS(policy_decision))`.
 - Pre-commitment `C_pre = sha256(H_w ‖ H_c ‖ H_p)` → order `custom_id = "writ:<writ_short>:<hex(C_pre)[0..40]>"` (≤ 127 chars).
 - Post-commitment `C_post = sha256(C_pre ‖ H_verifier ‖ H_approval)` → capture `invoice_id = "wv-<hex(C_post)[0..40]>"` (unique per merchant). Confirm both fields round-trip in Spike S8.
-- Ledger: `hash_i = sha256(hash_{i-1} ‖ type ‖ JCS(payload) ‖ ts)`.
+- Ledger: one hash chain **per Writ**, starting with its `WRIT_SIGNED` event, so an evidence pack is self-contained. `hash_i = sha256(prev_hash ‖ u32be(len) ‖ type ‖ u32be(len) ‖ JCS(payload) ‖ u32be(len) ‖ ts)`: prev_hash is 32 raw bytes (genesis: 32 zero bytes), each variable-length field is length-prefixed so the concatenation is unambiguous, `ts` is ISO 8601 UTC with exactly 3 fractional digits and is stored verbatim in `ledger_events.ts`. `seq`, `writ_id` and `purchase_id` are bound through `prev_hash` and the payloads, not hashed directly. Golden vector: `packages/ledger/test/chain.test.ts`.
+- PayPal ledger events carry the full commitments next to the truncated anchors: `PAYPAL_ORDER_CREATED {order_id, custom_id, c_pre, …}`, `PAYPAL_CAPTURED {capture_id, c_post, invoice_id, …}`, `PAYPAL_VOIDED {authorization_id, c_post | null, …}`; C_post is also computed for a void after the verifier ran, so the void path and the S8 fallback still bind the verifier and approval records.
+- `jcs` rejects anything that is not I-JSON (lone surrogates, array holes, undefined, bigint, non-finite numbers), so non-JS verifiers can reproduce every hash.
 - Evidence pack: all ledger events, the Writ, the WebAuthn assertion (authenticatorData, clientDataJSON, signature, COSE public key), PayPal order/authorization/capture IDs and `PayPal-Debug-Id`s, tracking, verifier record, human-readable PDF summary.
-- `writ-verify` (P1-5): recompute every hash, verify the WebAuthn signature with the embedded public key, re-run the deterministic policy, compare commitments to the PayPal order/capture. "Don't trust us — verify."
+- Evidence pack JSON (`writ-evidence/0.1`, `packages/ledger/src/evidence.ts`): `verifyEvidencePack` runs named PASS/FAIL/SKIP checks (chain, writ hash, H_c, H_p, C_pre, custom_id, H_verifier, H_approval, C_post, invoice_id, PayPal ids/anchors/amounts, `committed_amount`: cart total and policy amount must equal the captured amount, …).
+- `writ-verify` (P1-5): recompute every hash, verify the WebAuthn signature with the embedded public key, re-run the deterministic policy, compare commitments to the PayPal order/capture. "Don't trust us — verify." A pack re-forged consistently end to end passes every offline check, so writ-verify MUST also GET the PayPal order and capture and compare `custom_id`/`invoice_id`; it must require the signature check (no SKIP) and an approval record for a REVIEW decision.
 
 ### 6.8 Correctness (where the distributed-systems credibility comes from)
 - Money = integer minor units (`bigint` in TS and Postgres). Never floats. Format only at the UI edge.
@@ -421,10 +435,11 @@ WHERE writ_id = $2
   AND orders_count < max_orders
 RETURNING *;
 ```
-  Capture moves reserved → spent (+1 order); void/failure releases.
-- Idempotency: agent `Idempotency-Key` → unique `(agent_id, key)`; PayPal `PayPal-Request-Id = <purchase_id>:<step>`.
+  Implemented with the overflow-safe equivalent `$1 <= limit_minor - spent_minor - reserved_minor` (`apps/gateway/src/budget/reservations.ts`). Settle (reserved → spent, +1 order; guarded by `reserved_minor >= $1 AND orders_count < max_orders`) runs in the same transaction as the move to CAPTURING, before the PayPal capture call; if its guard fails the purchase goes to VOIDING. Void/failure releases the hold (guarded by `reserved_minor >= $1`). Settle/release are not idempotent per purchase: each must ride on a guarded purchase state change in the same transaction.
+  **Open decision:** the reservation counts only settled orders, so with `max_orders = 1` two concurrent checkouts can both reserve and both AUTHORIZE; the second settle fails and that purchase is voided. Money never exceeds the limit, but the buyer briefly sees an extra hold. Fix if it matters for T7: `held_orders INT` with reserve guard `orders_count + held_orders < max_orders`.
+- Idempotency: agent `Idempotency-Key` → unique `(agent_id, key)`; PayPal `PayPal-Request-Id = <purchase_id>:<step>` (capped at 108 chars, the Vault v3 limit). The OAuth token POST gets a fresh `oauth:<uuid>` so a retry is never handed a stored, possibly expired token.
 - Saga: state change + ledger event + outbox row in one DB transaction; PayPal calls happen after commit and are idempotent; a recovery job (every 30 s) resumes purchases stuck in AUTHORIZING / CAPTURING / VOIDING.
-- Webhooks: verify → insert by `event.id` (unique) → enqueue → handler re-fetches from PayPal before acting.
+- Webhooks: verify → insert by `event.id` (unique) → enqueue → handler re-fetches from PayPal before acting. Verification posts the event back exactly as received (number text preserved) with `PayPal-Request-Id = wh-verify:<transmission_id>:<24 hex of sha256(request)>`, so a forged body never gets a stored answer. Anything short of SUCCESS gets a non-2xx (400 FAILURE or missing headers, 503 unconfigured or PayPal error) and PayPal retries.
 - PayPal OAuth token cached, refreshed at `expires_in − 120 s`, single-flight.
 - Timeouts: PayPal 15 s; verifier 20 s with one fallback provider; timeout → REVIEW.
 - **Property test** (fast-check): 50 concurrent checkouts on a $100 Writ never exceed $100 captured + reserved.
@@ -439,11 +454,11 @@ RETURNING *;
 | 1 | OAuth 2.0 | `POST /v1/oauth2/token` | server auth | cache + single-flight refresh | P0 |
 | 2 | JS SDK **v6** | `https://www.sandbox.paypal.com/web-sdk/v6/core`; `createInstance` → `findEligibleMethods` → payment session; `<paypal-button>` | "Connect PayPal once" | **v5 is deprecated — don't use it** | P0 |
 | 3 | Vault (payment method tokens) | Save without purchase (setup token → payment token) or Orders v2 `payment_source.paypal.attributes.vault {store_in_vault: ON_SUCCESS, usage_type: MERCHANT, customer_type: CONSUMER}` | vaulted wallet for merchant-initiated agent payments | **Enable Vault in the sandbox app's Advanced options**; vault id is read from the order after authorize/capture | P0 |
-| 4 | Orders v2 | `POST /v2/checkout/orders` (AUTHORIZE, `vault_id`, `stored_credential`, `custom_id`), `GET /v2/checkout/orders/{id}` | agent purchase | confirm response shape in S1 | P0 |
+| 4 | Orders v2 | `POST /v2/checkout/orders` (AUTHORIZE, `vault_id`, `stored_credential`, `custom_id`), `GET /v2/checkout/orders/{id}` | agent purchase | `payment_source.paypal.stored_credential {payment_initiator: MERCHANT, usage: SUBSEQUENT, usage_pattern: IMMEDIATE}` per the Orders v2 schema; provisional until S1 runs live | P0 |
 | 5 | Payments v2 | `POST /v2/payments/authorizations/{id}/capture`, `/void` | two-key settlement | | P0 |
 | 6 | Refunds | `POST /v2/payments/captures/{id}/refund` | platform-liability route | | P0 (path; not in video) |
-| 7 | Webhooks | `POST /v1/notifications/verify-webhook-signature`; events `PAYMENT.AUTHORIZATION.*`, `PAYMENT.CAPTURE.*`, `CUSTOMER.DISPUTE.CREATED/UPDATED/RESOLVED`, `VAULT.PAYMENT-TOKEN.*` | state sync | register the Render URL on the sandbox app; dashboard simulator for tests | P0 |
-| 8 | Disputes v1 | list/show; `provide-evidence` (multipart JSON + files), `accept-claim`, `make-offer`, `send-message` | dispute defense | **sandbox-only:** `POST /v1/customer/disputes` (create; needs buyer `PayPal-Auth-Assertion` + buyer transaction id), `require-evidence`, `adjudicate` (`SELLER_FAVOR`/`BUYER_FAVOR`), `change-reason`. Actions appear a few minutes after creation | P0 |
+| 7 | Webhooks | `POST /v1/notifications/verify-webhook-signature`; events `PAYMENT.AUTHORIZATION.*`, `PAYMENT.CAPTURE.*`, `CUSTOMER.DISPUTE.CREATED/UPDATED/RESOLVED`, `VAULT.PAYMENT-TOKEN.*` | state sync | register the Render URL on the sandbox app (`scripts/spike-webhooks.ts register`); simulator for reachability only (mock events cannot be verified by postback); real events or `/v1/notifications/webhooks-events/{id}/resend` for verification. Events: PAYMENT.AUTHORIZATION.CREATED/VOIDED, PAYMENT.CAPTURE.COMPLETED/DECLINED/PENDING/REFUNDED/REVERSED, CUSTOMER.DISPUTE.CREATED/UPDATED/RESOLVED, VAULT.PAYMENT-TOKEN.CREATED/DELETED/DELETION-INITIATED | P0 |
+| 8 | Disputes v1 | list/show; `provide-evidence` (multipart JSON + files), `accept-claim`, `make-offer`, `send-message` | dispute defense | **sandbox-only:** `POST /v1/customer/disputes` (create; needs buyer `PayPal-Auth-Assertion` + buyer transaction id), `require-evidence`, `adjudicate` (`SELLER_FAVOR`/`BUYER_FAVOR`), `change-reason`. Actions appear a few minutes after creation. Create-by-API also needs the app scope `https://uri.paypal.com/services/disputes/create` (only a PayPal account manager adds it) and `buyer_transaction_id` from the **buyer's** activity, so expect UI-created disputes. require-evidence and adjudicate need UNDER_REVIEW: a UI dispute starts as an INQUIRY and is first escalated (`POST /v1/customer/disputes/{id}/escalate`). provide-evidence parts: `input` (JSON `{evidences[]}`) + `file1` (pdf/jpg/png/gif, < 10 MB each, ≤ 50 MB per call) | P0 |
 | 9 | Shipment tracking | `POST /v2/checkout/orders/{id}/track` | proof of fulfillment | | P1 |
 | 10 | Transaction Search | `GET /v1/reporting/transactions` | reconciliation | enable "Transaction search" on the app; ≤ 31-day range; new activity can lag ~3 h → never drive UI from it | P1 |
 | 11 | Agent Toolkit | `@paypal/agent-toolkit/ai-sdk`, read-only actions (`list_disputes`, `get_dispute`, `list_transactions`, `get_merchant_insights`) | console analyst tools | `configuration.context.sandbox: true` | P1 |
@@ -467,7 +482,7 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
   "payment_source": { "paypal": {
     "vault_id": "<payment token id>",
     "stored_credential": { "payment_initiator": "MERCHANT", "usage": "SUBSEQUENT",
-      "usage_pattern": "<decide in S1 from the documented enum>" } } }
+      "usage_pattern": "IMMEDIATE" } } }
 }
 ```
 - If the response is `COMPLETED`, read `purchase_units[0].payments.authorizations[0].id`; otherwise call `POST /v2/checkout/orders/{id}/authorize`.
@@ -496,7 +511,7 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
 ### 8.2 Intent Compiler
 - Input: user text + address-book **labels** + existing Writs. Output: `WritDraft {purpose ≤ 140 chars, constraints, clarifying_questions ≤ 2, assumptions[]}`.
 - Amounts → minor units; categories → our ~40-code taxonomy (unknown → ask, don't guess).
-- Defaults (shown, editable): approval threshold = min(50% of budget, $50); expiry 7 days; `max_orders` 1; deny-kinds ON; ship-to locked ON.
+- Defaults (shown, editable): approval threshold = min(50% of budget, $50, max_per_order); max_per_order = budget; expiry 7 days (max 90); `max_orders` 1; `max_checkouts_per_hour` 3; deny-kinds ON (gift_card, protection_plan, subscription, digital_goods, money_transfer, crypto); ship-to locked ON. A missing budget or categories → the compiler must ask (`draftToWritBody` throws `missing_fields`). Bodies are always built through `draftToWritBody` so list order, and therefore the hash, is canonical.
 - Never auto-signed. The user reviews the permission card and signs.
 - Eval: 30 prompts with expected key fields → ≥ 90% exact on budget / threshold / deadline; 100% schema-valid after one repair retry.
 
@@ -517,7 +532,7 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
 - Inputs: Writ (trusted), cart (typed), `ProductFacts` (typed), titles datamarked, sentinel flags (booleans only). **Not given:** raw pages, agent rationale.
 - Question: does each item plausibly satisfy the Writ's purpose and item constraints; is anything worth a human look?
 - Output: `{verdict: APPROVE|REVIEW|BLOCK, item_findings[{product_ref, fit: yes|unclear|no, reason ≤ 120}], confidence 0..1}`.
-- Rules: confidence < 0.7 → REVIEW; any `fit: no` → BLOCK; any flagged contributing source → ≥ REVIEW.
+- Rules: confidence < 0.7 → REVIEW; any `fit: no` → BLOCK; any `fit: unclear` → REVIEW; any flagged contributing source → ≥ REVIEW.
 - P1 "stacker": two independent samples (or two providers); disagreement → REVIEW.
 
 ### 8.6 Dispute Analyst
@@ -614,14 +629,14 @@ AG Grid's brief for this prize: polish via **custom widgets, theming and layout*
 | Language | TypeScript (strict) everywhere | Agent Toolkit, MCP SDK, AG Studio and the boilerplate are TS |
 | Web | Next.js (App Router) + Tailwind + shadcn/ui re-themed + Framer Motion | fast to polish |
 | Gateway | Fastify + Zod + Drizzle + Postgres + pg-boss | explicit backend; durable jobs without Redis |
-| PayPal | `@paypal/paypal-server-sdk` where it covers the endpoint; thin typed fetch client for the rest (verify coverage on Day 1) | official SDK + full control |
+| PayPal | thin typed fetch client in `packages/paypal` for every endpoint used (OAuth, Orders v2, Payments v2, Vault v3, Webhooks, Disputes); the server SDK is not installed | full control of `PayPal-Request-Id`, debug ids and multipart |
 | AI | Vercel AI SDK (`ai`) + provider packages; `@paypal/agent-toolkit/ai-sdk` | the toolkit plugs into the AI SDK |
 | Passkeys | `@simplewebauthn/server` + `@simplewebauthn/browser` | |
 | Canonical JSON | RFC 8785 (`canonicalize`) | stable hashes across languages |
 | PDF | `pdf-lib` | no headless browser needed on Render |
 | MCP | `@modelcontextprotocol/sdk` | you already contribute to it |
 | Tests | Vitest + fast-check (+ Playwright smoke in P1) | |
-| Deploy | Render Blueprint `render.yaml`: `writ-web` + `writ-gateway` (Starter) + Postgres (paid) | no spin-down, no 30-day DB expiry |
+| Deploy | Render Blueprint `render.yaml`: `writ-web` + `writ-gateway` (`0.5c-512mb`, formerly Starter; Node 22 pinned) + Postgres `0.1c-256mb` (smallest paid) | no spin-down, no 30-day DB expiry |
 
 ```text
 writ/
@@ -657,7 +672,7 @@ PAYPAL_SANDBOX_BUYER_EMAIL=        # dispute simulation (PayPal-Auth-Assertion)
 APP_BASE_URL=
 GATEWAY_BASE_URL=
 DATABASE_URL=
-WEBAUTHN_RP_ID=
+WEBAUTHN_RP_ID=                    # exact Wallet host, e.g. writ-web.onrender.com (onrender.com is a public suffix)
 WEBAUTHN_RP_NAME=Writ
 SESSION_SECRET=
 GATEWAY_ATTESTATION_KEY=           # Ed25519, P1-7
@@ -680,6 +695,15 @@ NEXT_PUBLIC_AG_STUDIO_LICENSE_KEY=
 # Judge mode
 JUDGE_MODE=true
 DEMO_HERO_RUNS_PER_HOUR=5
+# Gateway runtime and Day-1 spikes
+PORT=10000
+HOST=0.0.0.0
+LOG_LEVEL=info
+ENABLE_SPIKES=false
+SPIKE_PORT=8787
+SPIKE_PASSKEY_PORT=8788
+# Tests
+TEST_DATABASE_URL=
 ```
 
 ---
@@ -689,8 +713,8 @@ DEMO_HERO_RUNS_PER_HOUR=5
 | Resource | How | What you get | Use | Watch-outs |
 |---|---|---|---|---|
 | PayPal Developer | developer.paypal.com | sandbox | everything | US business "Writ Market", US personal "Ana", US personal "Buyer2"; high balances; app with **Vault** + **Transaction search** enabled; webhook → gateway URL. Sign-up issues from India → PayPal Discord immediately |
-| Render | claim portal on the Devpost Render page | $50 credits | web + gateway (Starter ~$7/mo each) + Postgres (paid basic ~$6/mo) | ≈ $20/mo → ≈ $30 through Dec 15; set a spend alert. **Never free Postgres** (expires 30 days after creation, before judging ends); free web services sleep after 15 min |
-| Channel3 | trychannel3.com/developers + code `PAYPAL-HACKATHON-2026` | 20,000 credits (≈ searches) | product search | cache aggressively; free top-ups via their Discord channel |
+| Render | claim portal on the Devpost Render page | $50 credits | web + gateway (`0.5c-512mb` each) + Postgres (`0.1c-256mb`, smallest paid); re-check prices before deploying | ≈ $20/mo → ≈ $30 through Dec 15; set a spend alert. **Never free Postgres** (expires 30 days after creation, before judging ends); free web services sleep after 15 min |
+| Channel3 | trychannel3.com/developers + code `PAYPAL-HACKATHON-2026` | 20,000 credits (≈ searches) | product search | docs moved to channel3.ai/docs (API host api.trychannel3.com unchanged); `/v1/search` costs 1 credit (limit ≤ 30); `GET /v1/products/{id}` is free and refreshes a cached snapshot; cache aggressively; free top-ups via their Discord channel |
 | AG Studio | ag-grid.com/studio license page | 45-day trial | console | **request on/after Nov 1 IST** so it covers Dec 15 |
 | Kernel | link with code `KERNELDEVPOST2026` | $50 credits | P2-1 only | |
 | APIMatic | form on the sponsor page | 1-month Basic (Context Plugin) | coding context; P2-3 | optional |
@@ -750,8 +774,8 @@ Order: S5 → S7 → S1 → S8 → S3 → S2 (start early — disputes need wait
 | ID | Question | Time box | DoD | Fallback (decide immediately if red) |
 |---|---|---|---|---|
 | S1 | Vault + merchant-initiated AUTHORIZE → capture and void work in sandbox? | 3 h | `scripts/spike-vault.ts` prints order, authorization, capture IDs; a second run voids; `usage_pattern` chosen; save-without-purchase vs. $1 save-with-purchase (auto-refunded, disclosed) decided | **Supervised mode:** each purchase uses the buyer's PayPal approval; Writ still enforces everything; story says "automatic when Agent Ready enables it" |
-| S2 | Full dispute lifecycle on a Writ capture? | 2 h + waiting | dispute created (API with `PayPal-Auth-Assertion`, or Resolution Center UI) → `require-evidence` (SELLER_EVIDENCE) → `provide-evidence` (multipart + PDF) → `adjudicate` SELLER_FAVOR → `RESOLVED` webhook received | Create disputes in the sandbox UI before recording; automate only the response side |
-| S3 | Webhooks reach Render and verify? | 1 h | `verify-webhook-signature` returns SUCCESS for a real event | Polling job every 30 s (still real API calls) |
+| S2 | Full dispute lifecycle on a Writ capture? | 2 h + waiting | dispute created in the sandbox Resolution Center UI as the buyer (API create attempted; expected to need the DISPUTE_CREATE scope) → escalate if INQUIRY → `require-evidence` (SELLER_EVIDENCE) → `provide-evidence` (multipart + PDF) → `adjudicate` SELLER_FAVOR → `RESOLVED` webhook received | Create disputes in the sandbox UI before recording; automate only the response side |
+| S3 | Webhooks reach Render and verify? | 1 h | `verify-webhook-signature` returns SUCCESS for a **real** event (from `spike-vault.ts capture` or a resend of a real event); simulator events cannot pass postback verification | Polling job every 30 s (still real API calls) |
 | S4 | AG Studio + our data + custom widget + AI harness via our proxy? | 3 h | dashboard renders 3 datasets; 1 custom widget; harness answers one prompt through `/api/ai/studio` | Studio without the chat harness + own chat using the Studio Toolkit; last resort AG Grid Enterprise + AG Charts (still eligible) |
 | S5 | Which model for which role? | 1.5 h | table: provider, model id, p50 latency, JSON-valid %, daily quota → router config committed | Paid fallback only with your explicit OK |
 | S6 | Passkey signing over an arbitrary hash on the Render domain? | 1.5 h | desktop Chrome + your phone sign a Writ hash; server verifies | Ed25519 device key (WebCrypto) labeled "device key" |

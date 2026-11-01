@@ -17,13 +17,17 @@ Agents shop; Writ checks every cart against your passkey-signed limits before Pa
 
 | Path | What it is |
 |---|---|
-| `packages/core` | Canonical JSON (RFC 8785), SHA-256, minor-unit money, PayPal commitments; Writ schema, signatures and the policy engine as they land |
-| `packages/ledger` | Hash-chained evidence ledger and evidence pack |
-| `packages/paypal` | Typed PayPal sandbox client, the only code allowed to move money |
-| `packages/ai` | Model router and typed AI roles |
-| `apps/gateway` | Fastify gateway: API, webhooks, decision pipeline, saga |
-| `scripts` | Day-1 spikes (plan §17), seed and smoke scripts |
-| `docs` | Spike results, architecture, daily scorecards |
+| `packages/core` | Canonical JSON (RFC 8785), SHA-256, minor-unit money, PayPal commitments, Writ and Cart schemas, taxonomy, passkey and device-key signatures, the deterministic policy engine and the monotonic combiner |
+| `packages/ledger` | Hash-chained evidence ledger (one chain per Writ) and the evidence pack with offline verification checks |
+| `packages/paypal` | Typed PayPal sandbox client (OAuth, Orders v2, Payments v2, Vault v3, Webhooks, Disputes), the only code allowed to move money |
+| `packages/ai` | Model router (model ids from env), structured output with repair, datamarking, Channel3 client |
+| `apps/gateway` | Fastify gateway: health, verified PayPal webhooks, Postgres schema and atomic budget reservations; decision pipeline and saga next |
+| `scripts` | Day-1 spikes (plan §17) |
+| `docs` | Spike runbook and results, daily scorecards |
+
+## Status
+
+Built and unit-tested: the core primitives (Writ schema and signatures, policy engine and combiner, evidence ledger, DB reservations) and the Day-1 spike scripts. **Nothing has run against the PayPal sandbox, Channel3, an LLM provider or Render yet.** The spikes in [`docs/SPIKES.md`](docs/SPIKES.md) are the next step, and every PayPal ID this project shows will come from those real sandbox runs.
 
 ## Development
 
@@ -37,7 +41,7 @@ pnpm install
 pnpm lint && pnpm typecheck && pnpm test
 ```
 
-Copy `.env.example` to `.env` and fill in **sandbox** credentials only.
+Copy `.env.example` to `.env` and fill in **sandbox** credentials only. Run a spike with `pnpm spike <file>.ts` (see [`docs/SPIKES.md`](docs/SPIKES.md)). The gateway's real-Postgres tests run when `TEST_DATABASE_URL` points at a disposable database.
 
 ## License
 
