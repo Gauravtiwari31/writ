@@ -52,9 +52,11 @@ export async function reserveBudget(db: Db, { writId, amountMinor }: BudgetChang
 }
 
 /**
- * Capture succeeded: moves `amountMinor` from reserved to spent and counts the order. Returns null
- * (nothing changed) when less than `amountMinor` is reserved or the order cap is already reached;
- * the caller must then void instead of capturing.
+ * Commits a hold to a capture: moves `amountMinor` from reserved to spent and counts the order.
+ * Run it in the transaction that moves the purchase to CAPTURING, i.e. before the PayPal capture
+ * call, so the order cap is enforced before money moves (§22 rule 14: no side effect before commit).
+ * Returns null (nothing changed) when less than `amountMinor` is reserved or max_orders is already
+ * reached; the purchase must then go to VOIDING instead.
  */
 export async function settleReservation(db: Db, { writId, amountMinor }: BudgetChange): Promise<WritBudget | null> {
   assertAmount(amountMinor);

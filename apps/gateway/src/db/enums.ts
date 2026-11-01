@@ -30,5 +30,12 @@ export type Verdict = (typeof VERDICTS)[number];
 export const AGENT_KINDS = ["builtin", "mcp", "sdk"] as const;
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
-/** Must equal `CurrencySchema.options` in @writ/core (asserted in test/db.test.ts). Kept local so drizzle-kit can load the schema without the core package graph. */
+// The two lists below mirror @writ/core (asserted in test/db.test.ts). They are kept local so
+// drizzle-kit can load schema.ts without evaluating the core package graph.
+
+/** Must equal `CurrencySchema.options` in @writ/core. */
 export const CURRENCIES = ["USD"] as const;
+
+/** Must equal `WRIT_STATUSES` in @writ/core. Status lives in the DB, never in the signed body. */
+export const WRIT_STATUSES = ["DRAFT", "ACTIVE", "REVOKED", "EXPIRED"] as const;
+export type WritStatus = (typeof WRIT_STATUSES)[number];

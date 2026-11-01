@@ -1,55 +1,57 @@
-// App-generated primary keys: "<prefix>_<26 chars of base32>" (128 random bits). The prefix makes
-// an id self-describing in logs, evidence packs and PayPal custom_id values; the random part is
-// lowercase [a-z2-7] so a slice of it is a valid writ_short for the order custom_id (plan §6.7).
+// App-generated primary keys are @writ/core ids: "<prefix>_<26-char ULID>" (48-bit ms time, then
+// 80 random bits). Writ and cart bodies validate writ_id, agent_id, cart_id, user_id and ship_to_ref
+// with core's idSchema, so rows that a signed document can reference MUST use core's prefixes, or
+// the gateway would mint ids its own contracts reject. Rows that never appear in a signed document
+// get gateway-local prefixes on the same ULID body (time-ordered, so inserts stay index-local).
+import { type Clock, type IdPrefix, isId as isCoreId, newId as newCoreId } from "@writ/core";
 
-export const ID_PREFIXES = {
+const CORE_ROW_PREFIXES = {
   user: "usr",
-  passkey: "pk",
-  deviceKey: "dk",
-  vaultToken: "vt",
   address: "adr",
-  agent: "ag",
+  agent: "agt",
   writ: "wr",
-  cart: "ct",
-  decision: "dc",
-  purchase: "pu",
-  approval: "ap",
-  dispute: "dp",
+  cart: "crt",
+  purchase: "pur",
+  approval: "apr",
+} as const satisfies Record<string, IdPrefix>;
+
+const LOCAL_ROW_PREFIXES = {
+  passkey: "psk",
+  deviceKey: "dvk",
+  vaultToken: "vlt",
+  decision: "dec",
+  dispute: "dsp",
   attack: "atk",
-  outbox: "ob",
+  outbox: "obx",
 } as const;
 
-export type IdKind = keyof typeof ID_PREFIXES;
+export const ROW_ID_PREFIXES = { ...CORE_ROW_PREFIXES, ...LOCAL_ROW_PREFIXES } as const;
+export type RowKind = keyof typeof ROW_ID_PREFIXES;
 
-const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
-const RANDOM_BYTES = 16;
+type CoreRowKind = keyof typeof CORE_ROW_PREFIXES;
+type LocalRowKind = keyof typeof LOCAL_ROW_PREFIXES;
 
-function base32(bytes: Uint8Array): string {
-  let out = "";
-  let buffer = 0;
-  let bits = 0;
-  for (const byte of bytes) {
-    buffer = (buffer << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      bits -= 5;
-      out += BASE32.charAt((buffer >>> bits) & 31);
-    }
-  }
-  if (bits > 0) out += BASE32.charAt((buffer << (5 - bits)) & 31);
-  return out;
+// Local ids take their ULID body from a core id so the encoding lives in exactly one place.
+const BODY_DONOR: IdPrefix = "usr";
+const DONOR_HEAD = `${BODY_DONOR}_`;
+
+function isCoreRowKind(kind: RowKind): kind is CoreRowKind {
+  return Object.hasOwn(CORE_ROW_PREFIXES, kind);
 }
 
-export function newId(kind: IdKind): string {
-  const bytes = new Uint8Array(RANDOM_BYTES);
-  crypto.getRandomValues(bytes);
-  return `${ID_PREFIXES[kind]}_${base32(bytes)}`;
+function localPrefix(kind: LocalRowKind): string {
+  return `${LOCAL_ROW_PREFIXES[kind]}_`;
 }
 
-const ID_RE = /^([a-z]+)_([a-z2-7]{26})$/;
+/** A fresh primary key for a `kind` row. `clock` is injectable for deterministic tests and replays. */
+export function newRowId(kind: RowKind, clock?: Clock): string {
+  if (isCoreRowKind(kind)) return newCoreId(CORE_ROW_PREFIXES[kind], clock);
+  return localPrefix(kind) + newCoreId(BODY_DONOR, clock).slice(DONOR_HEAD.length);
+}
 
-/** True when `id` has the shape newId(kind) produces; use it before trusting an id from a URL or body. */
-export function isId(kind: IdKind, id: string): boolean {
-  const match = ID_RE.exec(id);
-  return match !== null && match[1] === ID_PREFIXES[kind];
+/** True when `value` has the shape newRowId(kind) produces; check before trusting an id from a URL or body. */
+export function isRowId(kind: RowKind, value: string): boolean {
+  if (isCoreRowKind(kind)) return isCoreId(CORE_ROW_PREFIXES[kind], value);
+  const prefix = localPrefix(kind);
+  return value.startsWith(prefix) && isCoreId(BODY_DONOR, DONOR_HEAD + value.slice(prefix.length));
 }

@@ -10,7 +10,7 @@ import {
   createPgliteDb,
   type Db,
   isCheckViolation,
-  newId,
+  newRowId,
   runMigrations,
   users,
   type WritBudget,
@@ -23,8 +23,8 @@ const HUNDRED_DOLLARS = 10_000n;
 const PG_URL = process.env.TEST_DATABASE_URL ?? "";
 
 async function seedWrit(db: Db, limitMinor: bigint, maxOrders: number): Promise<string> {
-  const userId = newId("user");
-  const writId = newId("writ");
+  const userId = newRowId("user");
+  const writId = newRowId("writ");
   await db.insert(users).values({ id: userId, tenantId: TENANT, displayName: "Ana" });
   await db.insert(writs).values({
     id: writId,
@@ -159,9 +159,9 @@ for (const driver of drivers) {
     });
 
     it("returns null for a Writ without a budget row", async () => {
-      expect(await reserveBudget(db, { writId: newId("writ"), amountMinor: 1n })).toBeNull();
-      expect(await settleReservation(db, { writId: newId("writ"), amountMinor: 1n })).toBeNull();
-      expect(await releaseReservation(db, { writId: newId("writ"), amountMinor: 1n })).toBeNull();
+      expect(await reserveBudget(db, { writId: newRowId("writ"), amountMinor: 1n })).toBeNull();
+      expect(await settleReservation(db, { writId: newRowId("writ"), amountMinor: 1n })).toBeNull();
+      expect(await releaseReservation(db, { writId: newRowId("writ"), amountMinor: 1n })).toBeNull();
     });
 
     it("rejects zero, negative and out-of-range amounts before touching the database", async () => {

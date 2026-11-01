@@ -1,5 +1,5 @@
 // Postgres data model (plan §6.5). Every table carries tenant_id (judge-mode isolation) and
-// created_at. Primary keys are app-generated prefixed ids (see ids.ts) except ledger_events.seq
+// created_at. Primary keys are app-generated @writ/core ids (see ids.ts) except ledger_events.seq
 // and webhook_events.paypal_event_id. Money is bigint minor units, never numeric/float.
 import type { Currency, JsonValue } from "@writ/core";
 import { sql } from "drizzle-orm";
@@ -17,7 +17,17 @@ import {
   unique,
 } from "drizzle-orm/pg-core";
 import { bytea, literalList } from "./columns";
-import { AGENT_KINDS, CURRENCIES, PURCHASE_STATES, VERDICTS, type AgentKind, type PurchaseState, type Verdict } from "./enums";
+import {
+  AGENT_KINDS,
+  CURRENCIES,
+  PURCHASE_STATES,
+  VERDICTS,
+  WRIT_STATUSES,
+  type AgentKind,
+  type PurchaseState,
+  type Verdict,
+  type WritStatus,
+} from "./enums";
 
 const tenantId = () => text("tenant_id").notNull();
 const createdAt = () => timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
@@ -143,7 +153,7 @@ export const writs = pgTable(
     body: jsonb("body").$type<JsonValue>().notNull(),
     bodyHash: bytea("body_hash").notNull(),
     signature: jsonb("signature").$type<JsonValue>(),
-    status: text("status").notNull(),
+    status: text("status").$type<WritStatus>().notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: createdAt(),
   },
@@ -152,6 +162,7 @@ export const writs = pgTable(
     index("writs_agent_idx").on(t.agentId),
     index("writs_tenant_created_idx").on(t.tenantId, t.createdAt),
     check("writs_body_hash_check", sql`octet_length(${t.bodyHash}) = 32`),
+    check("writs_status_check", sql`${t.status} in (${literalList(WRIT_STATUSES)})`),
   ],
 );
 
@@ -302,7 +313,8 @@ export const approvals = pgTable(
 export const ledgerEvents = pgTable(
   "ledger_events",
   {
-    seq: bigserial("seq", { mode: "bigint" }).primaryKey(),
+    // A JS number, like @writ/ledger's LedgerEvent.seq; a sequence will not reach 2^53.
+    seq: bigserial("seq", { mode: "number" }).primaryKey(),
     tenantId: tenantId(),
     purchaseId: text("purchase_id").references(() => purchases.id),
     writId: text("writ_id")
@@ -312,14 +324,24 @@ export const ledgerEvents = pgTable(
     payload: jsonb("payload").$type<JsonValue>().notNull(),
     prevHash: bytea("prev_hash").notNull(),
     hash: bytea("hash").notNull(),
+    // The exact timestamp string inside the hash preimage (Date#toISOString form). Stored as text,
+    // not derived from created_at, so re-verifying a chain from the DB never depends on how a driver
+    // or column precision round-trips time.
+    ts: text("ts").notNull(),
     createdAt: createdAt(),
   },
   (t) => [
     unique("ledger_events_writ_prev_hash_unique").on(t.writId, t.prevHash),
     unique("ledger_events_hash_unique").on(t.hash),
+    // Loading a chain (or its tail) in order.
+    index("ledger_events_writ_seq_idx").on(t.writId, t.seq),
     index("ledger_events_purchase_idx").on(t.purchaseId),
     check("ledger_events_prev_hash_check", sql`octet_length(${t.prevHash}) = 32`),
     check("ledger_events_hash_check", sql`octet_length(${t.hash}) = 32`),
+    check(
+      "ledger_events_ts_check",
+      sql`${t.ts} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'`,
+    ),
   ],
 );
 

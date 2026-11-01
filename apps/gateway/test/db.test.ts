@@ -1,5 +1,16 @@
-import { CurrencySchema, sha256, utf8 } from "@writ/core";
-import { eq, sql } from "drizzle-orm";
+import {
+  CurrencySchema,
+  fromHex,
+  idSchema,
+  idTimestamp,
+  sha256,
+  toHex,
+  utf8,
+  WRIT_STATUSES as CORE_WRIT_STATUSES,
+  writShort,
+} from "@writ/core";
+import { appendEvent, type LedgerEvent, verifyChain } from "@writ/ledger";
+import { asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type AppDb,
@@ -12,12 +23,12 @@ import {
   type Db,
   disputes,
   executeRows,
-  ID_PREFIXES,
   isCheckViolation,
-  isId,
+  isRowId,
   isUniqueViolation,
   ledgerEvents,
-  newId,
+  newRowId,
+  ROW_ID_PREFIXES,
   passkeys,
   PURCHASE_STATES,
   purchases,
@@ -25,6 +36,7 @@ import {
   users,
   webhookEvents,
   writBudgets,
+  WRIT_STATUSES,
   writs,
 } from "../src/db/index";
 
@@ -50,6 +62,7 @@ const PLAN_TABLES = [
 ];
 
 const TENANT = "tn_dbtest";
+const TS = "2026-11-03T14:02:00.000Z";
 const PG_URL = process.env.TEST_DATABASE_URL ?? "";
 
 interface Fixture {
@@ -60,10 +73,10 @@ interface Fixture {
 }
 
 async function seed(db: Db): Promise<Fixture> {
-  const userId = newId("user");
-  const agentId = newId("agent");
-  const writId = newId("writ");
-  const cartId = newId("cart");
+  const userId = newRowId("user");
+  const agentId = newRowId("agent");
+  const writId = newRowId("writ");
+  const cartId = newRowId("cart");
   await db.insert(users).values({ id: userId, tenantId: TENANT, displayName: "Ana" });
   await db.insert(agents).values({
     id: agentId,
@@ -96,7 +109,7 @@ async function seed(db: Db): Promise<Fixture> {
 
 function purchaseRow(f: Fixture, overrides: Partial<typeof purchases.$inferInsert> = {}): typeof purchases.$inferInsert {
   return {
-    id: newId("purchase"),
+    id: newRowId("purchase"),
     tenantId: TENANT,
     writId: f.writId,
     cartId: f.cartId,
@@ -104,7 +117,7 @@ function purchaseRow(f: Fixture, overrides: Partial<typeof purchases.$inferInser
     state: "PROPOSED",
     amountMinor: 4400n,
     currency: "USD",
-    idempotencyKey: newId("purchase"),
+    idempotencyKey: newRowId("purchase"),
     ...overrides,
   };
 }
@@ -205,7 +218,7 @@ for (const driver of drivers) {
       await db.insert(purchases).values(PURCHASE_STATES.map((state) => purchaseRow(f, { state })));
       const bogus = db.execute(
         sql`insert into purchases (id, tenant_id, writ_id, cart_id, agent_id, state, amount_minor, currency, idempotency_key)
-            values (${newId("purchase")}, ${TENANT}, ${f.writId}, ${f.cartId}, ${f.agentId}, 'SHIPPED', 100, 'USD', ${newId("purchase")})`,
+            values (${newRowId("purchase")}, ${TENANT}, ${f.writId}, ${f.cartId}, ${f.agentId}, 'SHIPPED', 100, 'USD', ${newRowId("purchase")})`,
       );
       await expect(bogus).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "purchases_state_check"));
     });
@@ -217,7 +230,7 @@ for (const driver of drivers) {
       );
       const eur = db.execute(
         sql`insert into purchases (id, tenant_id, writ_id, cart_id, agent_id, state, amount_minor, currency, idempotency_key)
-            values (${newId("purchase")}, ${TENANT}, ${f.writId}, ${f.cartId}, ${f.agentId}, 'PROPOSED', 100, 'EUR', ${newId("purchase")})`,
+            values (${newRowId("purchase")}, ${TENANT}, ${f.writId}, ${f.cartId}, ${f.agentId}, 'PROPOSED', 100, 'EUR', ${newRowId("purchase")})`,
       );
       await expect(eur).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "purchases_currency_check"));
       await expect(db.insert(purchases).values(purchaseRow(f, { cPre: new Uint8Array(20) }))).rejects.toSatisfy(
@@ -230,6 +243,7 @@ for (const driver of drivers) {
       const f = await seed(db);
       const genesis = new Uint8Array(32);
       const first = sha256(utf8(`${f.writId}:1`));
+      const ts = TS;
       await db.insert(ledgerEvents).values({
         tenantId: TENANT,
         writId: f.writId,
@@ -237,6 +251,7 @@ for (const driver of drivers) {
         payload: { n: 1 },
         prevHash: genesis,
         hash: first,
+        ts,
       });
       const fork = db.insert(ledgerEvents).values({
         tenantId: TENANT,
@@ -245,6 +260,7 @@ for (const driver of drivers) {
         payload: { n: 2 },
         prevHash: genesis,
         hash: sha256(utf8(`${f.writId}:fork`)),
+        ts,
       });
       await expect(fork).rejects.toSatisfy((e: unknown) => isUniqueViolation(e, "ledger_events_writ_prev_hash_unique"));
 
@@ -255,8 +271,23 @@ for (const driver of drivers) {
         payload: { n: 2 },
         prevHash: first,
         hash: first,
+        ts,
       });
       await expect(duplicateHash).rejects.toSatisfy((e: unknown) => isUniqueViolation(e, "ledger_events_hash_unique"));
+
+      // The hashed timestamp must be exactly Date#toISOString form; anything else could not be re-verified.
+      for (const badTs of ["2026-11-03T14:02:00Z", "2026-11-03 14:02:00.000+00", "2026-11-03T14:02:00.000000Z"]) {
+        const malformed = db.insert(ledgerEvents).values({
+          tenantId: TENANT,
+          writId: f.writId,
+          type: "CART_PROPOSED",
+          payload: { n: 2 },
+          prevHash: first,
+          hash: sha256(utf8(`${f.writId}:${badTs}`)),
+          ts: badTs,
+        });
+        await expect(malformed, badTs).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "ledger_events_ts_check"));
+      }
 
       const [second] = await db
         .insert(ledgerEvents)
@@ -267,30 +298,88 @@ for (const driver of drivers) {
           payload: { n: 2 },
           prevHash: first,
           hash: sha256(utf8(`${f.writId}:2`)),
+          ts,
         })
         .returning();
-      expect(typeof second?.seq).toBe("bigint");
+      expect(second?.seq).toEqual(expect.any(Number));
+    });
+
+    it("stores a @writ/ledger chain that re-verifies after the round trip", async () => {
+      const f = await seed(db);
+      const purchaseId = newRowId("purchase");
+      await db.insert(purchases).values(purchaseRow(f, { id: purchaseId }));
+
+      // What the saga does: build the next event from the persisted tail, insert it, keep the DB seq.
+      let tail: LedgerEvent | null = null;
+      const steps = [
+        { type: "WRIT_SIGNED", payload: { writ_hash: toHex(sha256(f.writId)) }, writ_id: f.writId },
+        { type: "CART_PROPOSED", payload: { cart_id: f.cartId, total_minor: "4400" } },
+        { type: "BUDGET_RESERVED", payload: { amount_minor: "4400" }, purchase_id: purchaseId },
+      ] as const;
+      for (const [i, step] of steps.entries()) {
+        const event: LedgerEvent = appendEvent(tail, { ...step, ts: new Date(Date.parse(TS) + i * 1001) });
+        const [row] = await db
+          .insert(ledgerEvents)
+          .values({
+            tenantId: TENANT,
+            writId: event.writ_id,
+            purchaseId: event.purchase_id,
+            type: event.type,
+            payload: event.payload,
+            prevHash: fromHex(event.prev_hash),
+            hash: fromHex(event.hash),
+            ts: event.ts,
+          })
+          .returning();
+        if (!row) throw new Error("insert returned no row");
+        tail = { ...event, seq: row.seq };
+      }
+
+      const rows = await db.select().from(ledgerEvents).where(eq(ledgerEvents.writId, f.writId)).orderBy(asc(ledgerEvents.seq));
+      const chain = rows.map((r) => ({
+        seq: r.seq,
+        writ_id: r.writId,
+        purchase_id: r.purchaseId,
+        type: r.type,
+        payload: r.payload,
+        ts: r.ts,
+        prev_hash: toHex(r.prevHash),
+        hash: toHex(r.hash),
+      }));
+      expect(chain).toHaveLength(steps.length);
+      expect(verifyChain(chain)).toEqual({ ok: true });
+
+      // jsonb normalizes key order and whitespace, which JCS ignores; a changed value does not survive.
+      const tampered = chain.map((e, i) => (i === 1 ? { ...e, payload: { ...asObject(e.payload), total_minor: "1" } } : e));
+      expect(verifyChain(tampered)).toMatchObject({ ok: false, index: 1 });
+    });
+
+    it("rejects a Writ status outside the @writ/core lifecycle", async () => {
+      const f = await seed(db);
+      await db.update(writs).set({ status: "REVOKED" }).where(eq(writs.id, f.writId));
+      const bad = db.execute(sql`update writs set status = 'PAUSED' where id = ${f.writId}`);
+      await expect(bad).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "writs_status_check"));
     });
 
     it("enforces unique passkey credential ids, PayPal dispute ids and webhook event ids", async () => {
       const f = await seed(db);
-      const credentialId = newId("passkey");
+      const credentialId = newRowId("passkey");
       const passkey = { tenantId: TENANT, userId: f.userId, credentialId, publicKeyCose: utf8("cose") };
-      await db.insert(passkeys).values({ id: newId("passkey"), ...passkey });
-      await expect(db.insert(passkeys).values({ id: newId("passkey"), ...passkey })).rejects.toSatisfy((e: unknown) =>
+      await db.insert(passkeys).values({ id: newRowId("passkey"), ...passkey });
+      await expect(db.insert(passkeys).values({ id: newRowId("passkey"), ...passkey })).rejects.toSatisfy((e: unknown) =>
         isUniqueViolation(e, "passkeys_credential_id_unique"),
       );
       const [stored] = await db.select().from(passkeys).where(eq(passkeys.credentialId, credentialId));
       expect(stored).toMatchObject({ counter: 0, transports: [] });
 
-      const paypalDisputeId = `PP-D-${newId("dispute")}`;
-      await db.insert(disputes).values({ id: newId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" });
+      const paypalDisputeId = `PP-D-${newRowId("dispute")}`;
+      await db.insert(disputes).values({ id: newRowId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" });
       await expect(
-        db.insert(disputes).values({ id: newId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" }),
+        db.insert(disputes).values({ id: newRowId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" }),
       ).rejects.toSatisfy((e: unknown) => isUniqueViolation(e, "disputes_paypal_dispute_id_unique"));
 
       // Webhook dedupe (plan §6.8): the redelivery inserts nothing.
-      const event = { paypalEventId: `WH-${newId("outbox")}`, tenantId: TENANT, type: "PAYMENT.CAPTURE.COMPLETED", payload: {} };
+      const event = { paypalEventId: `WH-${newRowId("outbox")}`, tenantId: TENANT, type: "PAYMENT.CAPTURE.COMPLETED", payload: {} };
       const firstInsert = await db.insert(webhookEvents).values(event).onConflictDoNothing().returning();
       const redelivery = await db.insert(webhookEvents).values(event).onConflictDoNothing().returning();
       expect(firstInsert).toHaveLength(1);
@@ -301,7 +390,7 @@ for (const driver of drivers) {
       const f = await seed(db);
       const bad = db.execute(
         sql`insert into agents (id, tenant_id, user_id, name, kind, api_key_hash)
-            values (${newId("agent")}, ${TENANT}, ${f.userId}, 'x', 'browser', ${sha256("k")})`,
+            values (${newRowId("agent")}, ${TENANT}, ${f.userId}, 'x', 'browser', ${sha256("k")})`,
       );
       await expect(bad).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "agents_kind_check"));
     });
@@ -309,19 +398,52 @@ for (const driver of drivers) {
 }
 
 describe("schema constants", () => {
-  it("keeps the currency CHECK list in sync with @writ/core", () => {
+  it("keeps the CHECK lists in sync with @writ/core", () => {
     expect([...CURRENCIES]).toEqual(CurrencySchema.options);
+    expect([...WRIT_STATUSES]).toEqual([...CORE_WRIT_STATUSES]);
   });
 
-  it("generates prefixed, unique, writ_short-compatible ids", () => {
-    const ids = new Set(Array.from({ length: 1000 }, () => newId("writ")));
-    expect(ids.size).toBe(1000);
-    for (const id of ids) {
-      expect(id).toMatch(/^wr_[a-z2-7]{26}$/);
-      expect(isId("writ", id)).toBe(true);
-      expect(isId("purchase", id)).toBe(false);
+  it("mints ids that @writ/core contracts accept for every row a signed document references", () => {
+    const now = Date.parse(TS);
+    const clock = () => now;
+    const coreKinds = { user: "usr", address: "adr", agent: "agt", writ: "wr", cart: "crt", purchase: "pur", approval: "apr" } as const;
+    for (const [kind, prefix] of Object.entries(coreKinds) as [keyof typeof coreKinds, (typeof coreKinds)[keyof typeof coreKinds]][]) {
+      const id = newRowId(kind, clock);
+      expect(ROW_ID_PREFIXES[kind]).toBe(prefix);
+      expect(idSchema(prefix).safeParse(id).success, id).toBe(true);
+      expect(idTimestamp(id)).toBe(now);
     }
-    expect(new Set(Object.values(ID_PREFIXES)).size).toBe(Object.keys(ID_PREFIXES).length);
-    expect(isId("writ", "wr_../../etc")).toBe(false);
+    // writ_short for the PayPal custom_id (plan §6.7) works on gateway-minted Writ ids.
+    expect(writShort(newRowId("writ"))).toMatch(/^[0-9a-z]{12}$/);
+  });
+
+  it("gives every row kind a distinct prefix and a unique, time-ordered ULID body", () => {
+    const kinds = Object.keys(ROW_ID_PREFIXES) as (keyof typeof ROW_ID_PREFIXES)[];
+    expect(new Set(Object.values(ROW_ID_PREFIXES)).size).toBe(kinds.length);
+    for (const kind of kinds) {
+      const ids = new Set(Array.from({ length: 200 }, () => newRowId(kind)));
+      expect(ids.size).toBe(200);
+      for (const id of ids) {
+        expect(id).toMatch(new RegExp(`^${ROW_ID_PREFIXES[kind]}_[0-7][0-9a-hjkmnp-tv-z]{25}$`));
+        expect(isRowId(kind, id)).toBe(true);
+        for (const other of kinds) if (other !== kind) expect(isRowId(other, id), `${id} as ${other}`).toBe(false);
+      }
+    }
+    const early = newRowId("outbox", () => Date.parse("2026-11-01T00:00:00.000Z"));
+    const late = newRowId("outbox", () => Date.parse("2026-11-02T00:00:00.000Z"));
+    expect(early < late).toBe(true);
+  });
+
+  it("refuses malformed ids", () => {
+    for (const bad of ["wr_../../etc", "wr_", "", "psk_0123456789", `dec_${"u".repeat(26)}`, `wr_${"8".repeat(26)}`]) {
+      expect(isRowId("writ", bad), bad).toBe(false);
+      expect(isRowId("passkey", bad), bad).toBe(false);
+      expect(isRowId("decision", bad), bad).toBe(false);
+    }
   });
 });
+
+function asObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("expected an object");
+  return value as Record<string, unknown>;
+}
