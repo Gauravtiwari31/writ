@@ -17,14 +17,19 @@ export const IsoDateSchema = z.iso.date();
 export const IsoTimestampSchema = z.iso.datetime({ precision: 3 });
 
 const CONTROL_CHAR_RE = /\p{Cc}/u;
+const LONE_SURROGATE_RE = /\p{Cs}/u;
 
-/** Non-blank, at most `max` UTF-16 units, no control characters (no newlines to fake prompt structure). */
+/**
+ * Non-blank, at most `max` UTF-16 units, no control characters (no newlines to fake prompt
+ * structure), no lone surrogates (jcs refuses to hash them, so they must fail validation first).
+ */
 export function singleLineText(max: number) {
   return z
     .string()
     .min(1)
     .max(max)
     .refine((text) => !CONTROL_CHAR_RE.test(text), "control characters are not allowed")
+    .refine((text) => !LONE_SURROGATE_RE.test(text), "lone surrogates are not allowed")
     .refine((text) => text.trim().length > 0, "must not be blank");
 }
 

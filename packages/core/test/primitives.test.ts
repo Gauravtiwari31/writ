@@ -36,11 +36,17 @@ describe("jcs", () => {
     ["Date", { a: new Date(0) }],
     ["function", { a: () => 1 }],
     ["class instance", { a: new Map() }],
-  ])("rejects %s instead of silently dropping it", (_name, value) => {
+    // eslint-disable-next-line no-sparse-arrays -- the hole is the point: JSON.stringify writes it as null
+    ["array hole", [1, , 3]],
+    ["lone high surrogate in a value", { title: "mug \ud83c" }],
+    ["lone low surrogate in a value", ["\udf75 set"]],
+    ["lone surrogate in a key", { "a\ud800": 1 }],
+  ])("rejects %s instead of silently dropping or mangling it", (_name, value) => {
     expect(() => jcs(value)).toThrow(TypeError);
   });
 
-  it("accepts null-prototype objects", () => {
+  it("accepts paired surrogates (astral characters) and null-prototype objects", () => {
+    expect(jcs({ title: "Teacup 🍵" })).toBe('{"title":"Teacup 🍵"}');
     const obj = Object.assign(Object.create(null) as object, { k: "v" });
     expect(jcs(obj)).toBe('{"k":"v"}');
   });
