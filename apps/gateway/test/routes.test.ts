@@ -54,9 +54,9 @@ describe("route table", () => {
     for (const route of stubs) {
       const url = route.url.replace(/:([a-zA-Z]+)/g, (_m, name: string) => (name === "file" ? "tok.json" : `${name}_x`));
       const res = await t.app.inject({ method: route.method, url, ...(route.method === "POST" ? { payload: {} } : {}) });
-      // Already implemented by its stream: any status but 404/5xx-without-envelope is acceptable here.
+      // Implemented: a handler may answer 404 for an unknown token or a disabled mode, but never the "no such route" fallback.
       if (res.statusCode !== 501) {
-        expect(res.statusCode, `${route.method} ${url}`).not.toBe(404);
+        expect(res.json(), `${route.method} ${url}`).not.toEqual({ error: "not_found", message: "No such route." });
         continue;
       }
       expect(res.json(), `${route.method} ${url}`).toMatchObject({ error: "not_implemented", details: { owner: route.owner } });

@@ -3,12 +3,15 @@
 // repeats the action, and every action is counted, so a test can prove nothing was charged twice.
 import {
   CART_SPEC,
+  draftToWritBody,
   generateDeviceKeyEd25519,
   hashJcs,
   sha256,
+  signDeviceEd25519,
   toHex,
   VERIFICATION_SPEC,
   verificationRecordHash,
+  writHash,
   type Cart,
   type Verdict,
   type VerificationRecord,
@@ -155,20 +158,26 @@ export async function seedWrit(db: AppDb, options: { limitMinor?: bigint; maxOrd
   const limitMinor = options.limitMinor ?? 6000n;
   await db.insert(users).values({ id: userId, tenantId, displayName: "Ana" });
   await db.insert(agents).values({ id: agentId, tenantId, userId, name: "Atlas", kind: "sdk", apiKeyHash: sha256(agentId) });
-  const body = { spec: "test", writ_id: writId };
+  const device = generateDeviceKeyEd25519();
+  const body = draftToWritBody(
+    { purpose: "A pottery-themed gift", constraints: { total_minor: limitMinor.toString(), max_orders: options.maxOrders ?? 5, categories: ["home_kitchen"] }, clarifying_questions: [], assumptions: [] },
+    { writ_id: writId, user_id: userId, agent_id: agentId, ship_to: { ref: newRowId("address"), label: "Home" }, now: new Date() },
+  );
+  const bodyHash = writHash(body);
   await db.insert(writs).values({
     id: writId,
     tenantId,
     userId,
     agentId,
     body,
-    bodyHash: hashJcs(body),
+    bodyHash,
+    signature: signDeviceEd25519(bodyHash, device.secretKey),
     status: "ACTIVE",
     expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
     signedAt: new Date(),
   });
   await db.insert(writBudgets).values({ writId, tenantId, limitMinor, maxPerOrderMinor: limitMinor, maxOrders: options.maxOrders ?? 5 });
-  const genesis = appendEvent(null, { type: "WRIT_SIGNED", payload: { writ_id: writId, writ_hash: toHex(hashJcs(body)) }, ts: new Date(), purchase_id: null, writ_id: writId });
+  const genesis = appendEvent(null, { type: "WRIT_SIGNED", payload: { writ_id: writId, writ_hash: toHex(bodyHash) }, ts: new Date(), purchase_id: null, writ_id: writId });
   await db.insert(ledgerEvents).values({
     tenantId,
     writId,
@@ -182,7 +191,6 @@ export async function seedWrit(db: AppDb, options: { limitMinor?: bigint; maxOrd
   if (options.vault !== false) {
     await db.insert(paypalVaultTokens).values({ id: newRowId("vaultToken"), tenantId, userId, vaultId: `VAULT-${writId}`, status: "ACTIVE" });
   }
-  const device = generateDeviceKeyEd25519();
   if (options.deviceKey !== false) {
     await db.insert(deviceKeys).values({ id: newRowId("deviceKey"), tenantId, userId, publicKeyEd25519: device.publicKey, label: "test" });
   }

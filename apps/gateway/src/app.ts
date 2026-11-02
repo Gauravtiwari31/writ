@@ -33,6 +33,11 @@ import { createServices } from "./services";
 import { passkeySpikePlugin } from "./spikes/passkey";
 import { durableWebhookDedupe } from "./webhooks/index";
 
+/** A capability link in a log line would defeat storing only its hash. */
+function maskCapabilityTokens(request: { method: string; url: string }): { method: string; url: string } {
+  return { method: request.method, url: request.url.replace(/(\/v1\/evidence\/)[A-Za-z0-9_-]+/, "$1***") };
+}
+
 export interface GatewayDeps {
   /** undefined: PayPal postback verifier built from config; null: none (deliveries get 503). */
   readonly verifyWebhook?: WebhookVerifier | null;
@@ -65,7 +70,7 @@ const STREAM_ROUTES: readonly FastifyPluginAsync[] = [
 export async function buildApp(config: GatewayConfig, deps: GatewayDeps = {}): Promise<FastifyInstance> {
   // Bodies are parsed with Zod (http/errors.ts parseWith), so Fastify's JSON-schema compilers load
   // only if a route ever declares a JSON schema (http/fastify.ts: ~190 ms off every cold start).
-  const app = Fastify({ logger: deps.logger ?? { level: config.logLevel }, schemaController: lazySchemaController() });
+  const app = Fastify({ logger: deps.logger ?? { level: config.logLevel, serializers: { req: maskCapabilityTokens } }, schemaController: lazySchemaController() });
   const services = createServices(config, { db: deps.db ?? null, log: app.log, overrides: deps.services ?? {} });
   app.decorate("services", services);
 
