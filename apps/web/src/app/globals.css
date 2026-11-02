@@ -1,7 +1,7 @@
 /*
- * Writ design tokens (plan §10: "a notary's desk, digitized"). Owner: web-foundation stream, which
- * builds the full design system on these: one serif, one sans, one mono, one accent, 8-pt spacing,
- * dark mode, reduced motion. Only the starting tokens live here.
+ * Writ design tokens (plan §10: "a notary's desk, digitized"): parchment surfaces, ink text, one vermilion
+ * accent for signatures, monospace hashes shown like serial numbers. One serif, one sans, one mono, 8-pt
+ * spacing. Dark mode swaps ink and parchment. Motion respects prefers-reduced-motion.
  */
 @import "tailwindcss";
 
@@ -17,17 +17,72 @@
 
 :root {
   color-scheme: light dark;
-}
-
-body {
-  background: var(--color-parchment);
-  color: var(--color-ink);
-  font-family: var(--font-sans);
+  --surface: #fbf9f4;
+  --page: #f6f3ec;
+  --text: #0f1115;
+  --muted: #5e6371;
+  --line: #dcd6c8;
+  --approve: #256b42;
+  --approve-bg: #e3f0e7;
+  --review: #8c5a00;
+  --review-bg: #fbefd5;
+  --block: #b3301f;
+  --block-bg: #fbe3de;
 }
 
 @media (prefers-color-scheme: dark) {
-  body {
-    background: var(--color-ink);
-    color: var(--color-parchment);
+  :root {
+    --surface: #1a1d24;
+    --page: #0f1115;
+    --text: #f6f3ec;
+    --muted: #a3a7b3;
+    --line: #2e323c;
+    --approve: #7fd1a0;
+    --approve-bg: #16291e;
+    --review: #e8bd6a;
+    --review-bg: #2e2412;
+    --block: #f29a8c;
+    --block-bg: #331a16;
+  }
+}
+
+body {
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-seal);
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-serif);
+}
+
+@keyframes seal-stamp {
+  0% {
+    transform: scale(1.8) rotate(-14deg);
+    opacity: 0;
+  }
+  70% {
+    transform: scale(0.94) rotate(3deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) rotate(0);
+  }
+}
+
+.seal-stamp {
+  animation: seal-stamp 420ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .seal-stamp {
+    animation: none;
   }
 }

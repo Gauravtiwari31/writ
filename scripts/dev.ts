@@ -21,6 +21,7 @@ const env: NodeJS.ProcessEnv = {
   DATABASE_URL: optionalEnv("DATABASE_URL") ?? `pglite:${resolve(REPO_ROOT, ".data/gateway")}`,
   HOST: optionalEnv("HOST") ?? "127.0.0.1",
   PORT: gatewayPort,
+  JUDGE_MODE: optionalEnv("JUDGE_MODE") ?? "true",
   NEXT_TELEMETRY_DISABLED: "1",
 };
 

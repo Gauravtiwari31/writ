@@ -105,7 +105,6 @@ export async function receipt(deps: CoreServices, tenantId: string, purchaseId: 
   const [cart] = await db.select({ hash: carts.bodyHash }).from(carts).where(eq(carts.id, purchase.cartId));
   const hex = (value: Uint8Array | null | undefined): string | null => (value === null || value === undefined ? null : toHex(value));
   const signature = writ.signature as WritSignature | null;
-  const mine = events.filter((event) => event.purchase_id === purchaseId || event.type === "WRIT_SIGNED");
   const orderEvent = events.find((event) => event.purchase_id === purchaseId && event.type === "PAYPAL_ORDER_CREATED");
   const captureEvent = events.find((event) => event.purchase_id === purchaseId && event.type === "PAYPAL_CAPTURED");
   return {
@@ -128,7 +127,8 @@ export async function receipt(deps: CoreServices, tenantId: string, purchaseId: 
       custom_id: typeof orderEvent?.payload["custom_id"] === "string" ? orderEvent.payload["custom_id"] : null,
       invoice_id: typeof captureEvent?.payload["invoice_id"] === "string" ? captureEvent.payload["invoice_id"] : null,
     },
-    events: mine.map(ledgerEventView),
+    // The whole chain, so the Wallet can re-verify it in the browser; this purchase is marked by purchase_id.
+    events: events.map(ledgerEventView),
     checks: (verification?.checks ?? []).map((check) => ({ name: check.name, status: check.status, detail: check.detail.slice(0, 500) })),
     pack_available: pack !== null,
   };
