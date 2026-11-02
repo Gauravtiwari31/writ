@@ -448,6 +448,8 @@ rate_counters(tenant_id, bucket, window_start, count)  PK(tenant_id, bucket, win
 
 The complete table (auth, request/response schema and owning build stream per route) is `apps/gateway/src/routes/table.ts`, mirrored in `docs/ARCHITECTURE.md` §4 and asserted by `apps/gateway/test/routes.test.ts`; bodies are the Zod schemas in `@writ/core/api`.
 
+`POST /v1/auth/device-wallet` creates a wallet with no passkey for browsers without an authenticator (S6 fallback, always labeled "device key"). A user with a passkey cannot add a device key, and device keys can sign or approve only for a user with no passkey.
+
 **Passkeys and hosts (found in S6 prep, decided Nov 1).** `onrender.com` is on the Public Suffix List, so `writ-web.onrender.com` and `writ-gateway.onrender.com` cannot share a parent RP ID and a passkey made on one cannot be used on the other. Every WebAuthn ceremony (registration, sign-in, Writ signing, approvals) runs in the Wallet on its origin (`APP_BASE_URL`, RP ID = Wallet host, `localhost` locally); the gateway only verifies, with `expectedOrigin = APP_BASE_URL` and `expectedRPID = WEBAUTHN_RP_ID`. The browser only ever talks to the Wallet origin: Next.js rewrites `/gw/:path*` to `GATEWAY_BASE_URL`, so the session cookie is first-party on the Wallet host. Agents call the gateway directly. The challenge is the 32 raw bytes of the hash (`@simplewebauthn/server` UTF-8-encodes string challenges), verified with `expectedChallenge = base64url(hash)` and `requireUserVerification: true`. Verification lives on the `@writ/core/signatures` subpath so the Wallet bundle never pulls in server code.
 
 ### 6.7 Evidence and PayPal anchoring

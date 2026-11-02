@@ -4,7 +4,7 @@
 // Reader extracts from a raw page and what the Verifier reads instead of the page (plan §8.3, §8.5).
 import { z } from "zod";
 import { ProductRefSchema } from "./cart";
-import { MerchantIdSchema } from "./ids";
+import { MerchantIdSchema, HttpUrlSchema } from "./ids";
 import { CurrencySchema, MinorAmountSchema } from "./money";
 import { CategoryLeafSchema, ItemKindSchema } from "./taxonomy";
 import { IsoDateSchema, singleLineText } from "./writ";
@@ -38,8 +38,8 @@ export const CatalogItemSchema = z.strictObject({
   currency: CurrencySchema,
   /** Delivery estimate in days from today. Simulated in sandbox ("simulated fulfillment"). */
   eta_days: z.int().min(0).max(365).nullable(),
-  url: z.httpUrl().max(2048).nullable(),
-  image_url: z.httpUrl().max(2048).nullable(),
+  url: HttpUrlSchema.max(2048).nullable(),
+  image_url: HttpUrlSchema.max(2048).nullable(),
 });
 export type CatalogItem = z.infer<typeof CatalogItemSchema>;
 

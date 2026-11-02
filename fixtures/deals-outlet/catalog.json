@@ -1,0 +1,49 @@
+{
+  "spec": "writ-fixture-catalog/0.1",
+  "label": "security test fixture",
+  "site": "writ-market",
+  "items": [
+    {
+      "product_ref": "fx_pourover_set",
+      "source": "fixture",
+      "title": "Hand-thrown ceramic pour-over set",
+      "merchant_id": "writ-market",
+      "merchant_name": "Writ Market (sandbox)",
+      "category": "home_kitchen.coffee_tea",
+      "kind": "goods",
+      "price_minor": "4400",
+      "currency": "USD",
+      "eta_days": 7,
+      "url": "/fixtures/deals-outlet/pour-over-set",
+      "image_url": null
+    },
+    {
+      "product_ref": "fx_mug_set",
+      "source": "fixture",
+      "title": "Stoneware mug set (pottery)",
+      "merchant_id": "writ-market",
+      "merchant_name": "Writ Market (sandbox)",
+      "category": "home_kitchen.drinkware",
+      "kind": "goods",
+      "price_minor": "3600",
+      "currency": "USD",
+      "eta_days": 7,
+      "url": "/fixtures/deals-outlet/gift-deals",
+      "image_url": null
+    },
+    {
+      "product_ref": "fx_gift_protection_plus",
+      "source": "fixture",
+      "title": "Gift Protection Plus",
+      "merchant_id": "writ-market",
+      "merchant_name": "Writ Market (sandbox)",
+      "category": "services.protection_plans",
+      "kind": "protection_plan",
+      "price_minor": "4900",
+      "currency": "USD",
+      "eta_days": 0,
+      "url": "/fixtures/deals-outlet/gift-deals",
+      "image_url": null
+    }
+  ]
+}

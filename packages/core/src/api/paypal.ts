@@ -4,6 +4,7 @@
 // Vault payment token stored per user (paypal_vault_tokens). The redirect fallback uses the
 // setup token's approve URL. Without PAYPAL_CLIENT_ID the Wallet shows "not configured".
 import { z } from "zod";
+import { HttpUrlSchema } from "../ids";
 import { localIdSchema, TimestampSchema } from "./common";
 
 /** JS SDK v6 core script (plan §7 row 2). v5 is deprecated: never load it. */
@@ -41,7 +42,7 @@ export type CreateSetupTokenRequest = z.infer<typeof CreateSetupTokenRequestSche
 export const CreateSetupTokenResponseSchema = z.strictObject({
   setup_token_id: z.string().min(1).max(64),
   /** PayPal-hosted approval page (redirect fallback); null for the SDK flow. */
-  approve_url: z.httpUrl().nullable(),
+  approve_url: HttpUrlSchema.nullable(),
 });
 export type CreateSetupTokenResponse = z.infer<typeof CreateSetupTokenResponseSchema>;
 

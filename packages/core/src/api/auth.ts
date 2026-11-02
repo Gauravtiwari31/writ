@@ -94,6 +94,14 @@ export const RegisterDeviceKeyRequestSchema = z.strictObject({
 });
 export type RegisterDeviceKeyRequest = z.infer<typeof RegisterDeviceKeyRequestSchema>;
 
+// POST /v1/auth/device-wallet: a wallet with no passkey, for browsers without an authenticator (S6 fallback).
+export const CreateDeviceWalletRequestSchema = z.strictObject({
+  display_name: singleLineText(60),
+  public_key: Base64UrlSchema.length(43),
+  label: singleLineText(60),
+});
+export type CreateDeviceWalletRequest = z.infer<typeof CreateDeviceWalletRequestSchema>;
+
 /** What agents and most screens see of an address: never the street (threats T2, T6). */
 export const AddressRefSchema = z.strictObject({ address_id: idSchema("adr"), label: singleLineText(40) });
 export type AddressRef = z.infer<typeof AddressRefSchema>;

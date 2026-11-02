@@ -1,10 +1,9 @@
 // AgentApiClient against a fetch fake: auth header, Idempotency-Key, contract parsing, a 403 policy
-// BLOCK as a typed answer, and typed errors. The stubs reject with NotImplementedError until the
-// agents stream lands.
-import { isNotImplementedError, newId } from "@writ/core";
+// BLOCK as a typed answer, and typed errors.
+import { newId } from "@writ/core";
 import type { CheckoutResponse } from "@writ/core/api";
 import { describe, expect, it } from "vitest";
-import { AgentApiClient, AgentApiError, createAtlas, createPageReader, createScout, type FetchLike } from "../src/index";
+import { AgentApiClient, AgentApiError, type FetchLike } from "../src/index";
 
 const KEY = `wak_${"k".repeat(43)}`;
 
@@ -77,24 +76,5 @@ describe("AgentApiClient", () => {
     expect((await client.search({ query: "pottery gift" })).source).toBe("unavailable");
     await expect(client.getProduct("a/b")).rejects.toMatchObject({ code: "invalid_response" });
     expect(calls[1]?.url).toBe("http://gw.test/v1/agent/products/a%2Fb");
-  });
-});
-
-describe("agent stubs", () => {
-  it("reject with NotImplementedError until the agents stream implements them", async () => {
-    const client = new AgentApiClient({ baseUrl: "http://gw.test", apiKey: KEY });
-    const pageReader = createPageReader({ allowedOrigins: ["http://localhost:3000"] });
-    await expect(pageReader.read("http://localhost:3000/fixtures/deals-outlet/")).rejects.toSatisfy(isNotImplementedError);
-    const context = {
-      writId: newId("wr"),
-      goal: "gift",
-      signal: new AbortController().signal,
-      emit: () => Promise.resolve(),
-      consumeLlmCall: () => Promise.resolve(true),
-    };
-    expect(createAtlas({ models: [], client, pageReader }).kind).toBe("atlas");
-    await expect(createAtlas({ models: [], client, pageReader }).run(context)).rejects.toSatisfy(isNotImplementedError);
-    const reader = { read: () => Promise.reject(new Error("unused")) };
-    await expect(createScout({ models: [], client, pageReader, reader }).run(context)).rejects.toSatisfy(isNotImplementedError);
   });
 });

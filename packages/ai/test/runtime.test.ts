@@ -1,7 +1,4 @@
-// createAiRuntime: plan decision 7 (no keys → still boots, every role unavailable, callers fail
-// closed) and the stub contract (configured roles exist; until the ai stream lands they reject with
-// NotImplementedError, which every caller already treats as a failure).
-import { isNotImplementedError } from "@writ/core";
+// createAiRuntime: plan decision 7 (no keys → still boots, every role unavailable, callers fail closed).
 import { MockLanguageModelV4 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import { createAiRuntime, resolveAllRoles, ROLES } from "../src/index";
@@ -29,9 +26,9 @@ describe("createAiRuntime", () => {
     expect(runtime.status.agent).toBe("configured");
     expect(runtime.agentModels?.map((model) => model.spec)).toEqual(["groq:mock-b", "groq:mock-c"]);
     expect(runtime.compiler).not.toBeNull();
-    await expect(runtime.compiler?.compile({ text: "gift", addresses: [], existing_writs: [], now: "2026-11-03T14:02:00.000Z" })).rejects.toSatisfy(
-      isNotImplementedError,
-    );
+    // A model that fails is an answer, never a throw: the caller falls back to the manual editor.
+    const result = await runtime.compiler?.compile({ text: "gift", addresses: [], existing_writs: [], now: "2026-11-03T14:02:00.000Z" });
+    expect(result?.ok).toBe(false);
   });
 
   it("marks a role with a missing key or a bad spec invalid (no secret values in the message)", () => {

@@ -1,18 +1,48 @@
 // Built-in agent runs started from the Wallet (P0-3): delegate to services.runs.
-// Owner: agents stream. Paths and auth are frozen in routes/table.ts; bodies are the named
-// @writ/core/api schemas. Every route answers 501 not_implemented until the owner fills it in.
+import { RunIdSchema, StartRunRequestSchema } from "@writ/core/api";
+import { desc, eq } from "drizzle-orm";
 import type { FastifyPluginAsync } from "fastify";
-import { notImplemented } from "../http/errors";
+import { z } from "zod";
+import { sessionOf } from "../auth/guards";
+import { agentRuns } from "../db/schema";
+import { requireDb } from "../deps";
+import { parseWith } from "../http/errors";
+import { runDetail, runView } from "../runs/index";
 
-const OWNER = "agents";
+const IdParams = z.strictObject({ id: RunIdSchema });
 
 export const runRoutes: FastifyPluginAsync = async (app) => {
-  // session → RunView (202)
-  app.post("/v1/runs", notImplemented(OWNER, "POST /v1/runs"));
-  // session → ListRunsResponse
-  app.get("/v1/runs", notImplemented(OWNER, "GET /v1/runs"));
-  // session → RunDetailResponse
-  app.get("/v1/runs/:id", notImplemented(OWNER, "GET /v1/runs/:id"));
-  // session → RunView
-  app.post("/v1/runs/:id/stop", notImplemented(OWNER, "POST /v1/runs/:id/stop"));
+  const services = app.services;
+
+  app.post("/v1/runs", async (request, reply) => {
+    const session = sessionOf(request);
+    const body = parseWith(StartRunRequestSchema, request.body);
+    const run = await services.runs.start({
+      tenantId: session.tenantId,
+      userId: session.userId,
+      agentKind: body.agent,
+      writId: body.writ_id,
+      mode: "manual",
+      ...(body.goal === undefined ? {} : { goal: body.goal }),
+    });
+    return reply.code(202).send(run);
+  });
+
+  app.get("/v1/runs", async (request) => {
+    const session = sessionOf(request);
+    const rows = await requireDb(services).select().from(agentRuns).where(eq(agentRuns.tenantId, session.tenantId)).orderBy(desc(agentRuns.createdAt)).limit(200);
+    return { runs: rows.map(runView) };
+  });
+
+  app.get("/v1/runs/:id", async (request) => {
+    const session = sessionOf(request);
+    const { id } = parseWith(IdParams, request.params, "path");
+    return runDetail(requireDb(services), session.tenantId, id);
+  });
+
+  app.post("/v1/runs/:id/stop", async (request) => {
+    const session = sessionOf(request);
+    const { id } = parseWith(IdParams, request.params, "path");
+    return services.runs.stop({ tenantId: session.tenantId, runId: id });
+  });
 };

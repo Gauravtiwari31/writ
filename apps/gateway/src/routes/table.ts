@@ -41,6 +41,7 @@ export const ROUTE_TABLE: readonly RouteSpec[] = [
   r("POST", "/v1/auth/logout", "api", "session", null, "204 + cleared cookie", "auth.ts"),
   r("GET", "/v1/me", "api", "session", null, "MeResponse", "auth.ts"),
   r("POST", "/v1/auth/device-keys", "api", "session", "RegisterDeviceKeyRequest", "DeviceKeyView", "auth.ts"),
+  r("POST", "/v1/auth/device-wallet", "api", "none", "CreateDeviceWalletRequest", "SessionView + Set-Cookie", "auth.ts"),
   r("GET", "/v1/address-book", "api", "session", null, "AddressListResponse", "auth.ts"),
   r("POST", "/v1/address-book", "api", "session", "CreateAddressRequest", "AddressDetail", "auth.ts"),
 

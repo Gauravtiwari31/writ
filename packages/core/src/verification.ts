@@ -5,7 +5,7 @@
 // row of stage "combiner" (output + output_hash).
 import { z } from "zod";
 import { hashJcs, HashHexSchema } from "./hash";
-import { idSchema } from "./ids";
+import { idSchema, HttpUrlSchema } from "./ids";
 import { COMBINER_REASON_CODES, DECISION_STAGES } from "./policy/combiner";
 import { SentinelCategorySchema, VerdictSchema, VerifierOutputSchema } from "./verdicts";
 import { IsoTimestampSchema } from "./writ";
@@ -21,7 +21,7 @@ export const StageContributionSchema = z.strictObject({
 /** One Sentinel signal per scanned source, reduced to what the combiner used (spans live in the attacks table). */
 export const SentinelSummarySchema = z.strictObject({
   /** The scanned source; null for a cart-line title or description scan. */
-  source_url: z.httpUrl().max(2048).nullable(),
+  source_url: HttpUrlSchema.max(2048).nullable(),
   status: z.enum(["ok", "error", "timeout"]),
   is_injection: z.boolean().nullable(),
   category: SentinelCategorySchema.nullable(),

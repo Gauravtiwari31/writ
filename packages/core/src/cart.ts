@@ -3,7 +3,7 @@
 // any attempt to name one (threat T3).
 import { z } from "zod";
 import { hashJcs, hashJcsHex } from "./hash";
-import { idSchema, MerchantIdSchema } from "./ids";
+import { idSchema, MerchantIdSchema, HttpUrlSchema } from "./ids";
 import { CurrencySchema, MinorAmountSchema, parseMinor } from "./money";
 import { CategoryLeafSchema, ItemKindSchema } from "./taxonomy";
 import { IsoDateSchema, IsoTimestampSchema, singleLineText } from "./writ";
@@ -92,7 +92,7 @@ export function cartHashHex(cart: Cart): string {
  * it: the Sentinel scans these, the Verifier only ever sees the resulting flags.
  */
 export const CartSourceSchema = z.strictObject({
-  url: z.httpUrl().max(2048),
+  url: HttpUrlSchema.max(2048),
   kind: z.enum(["page", "search_result", "listing"]),
   fetched_at: IsoTimestampSchema,
   /**

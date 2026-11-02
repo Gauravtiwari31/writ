@@ -91,3 +91,6 @@ export const MerchantIdSchema = z
   .string()
   .regex(/^[a-z0-9](?:[a-z0-9._:-]{0,62}[a-z0-9])?$/, "merchant id: lowercase slug or domain, 1-64 chars");
 export type MerchantId = z.infer<typeof MerchantIdSchema>;
+
+/** http(s) only. Unlike z.httpUrl it accepts localhost, where the Wallet serves fixture pages in local runs. */
+export const HttpUrlSchema = z.url({ protocol: /^https?$/ });

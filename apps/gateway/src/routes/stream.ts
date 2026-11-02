@@ -1,12 +1,18 @@
-// GET /v1/stream: tenant-scoped SSE fed from committed events (use http/sse.ts openSse + services.events).
-// Owner: api stream. Paths and auth are frozen in routes/table.ts; bodies are the named
-// @writ/core/api schemas. Every route answers 501 not_implemented until the owner fills it in.
+// GET /v1/stream: tenant-scoped SSE fed only from committed events.
 import type { FastifyPluginAsync } from "fastify";
-import { notImplemented } from "../http/errors";
-
-const OWNER = "api";
+import { sessionOf } from "../auth/guards";
+import { openSse } from "../http/sse";
 
 export const streamRoutes: FastifyPluginAsync = async (app) => {
-  // session → text/event-stream of StreamMessage
-  app.get("/v1/stream", notImplemented(OWNER, "GET /v1/stream"));
+  app.get("/v1/stream", async (request, reply) => {
+    const session = sessionOf(request);
+    const channel = openSse(request, reply);
+    const lastEventId = request.headers["last-event-id"];
+    if (typeof lastEventId === "string") {
+      for (const message of app.services.events.since(session.tenantId, lastEventId) ?? []) channel.send(message);
+    }
+    const unsubscribe = app.services.events.subscribe(session.tenantId, (message) => channel.send(message));
+    channel.onClose(unsubscribe);
+    return reply;
+  });
 };
