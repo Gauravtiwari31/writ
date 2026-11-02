@@ -10,6 +10,7 @@
 //
 // FROZEN for the parallel build (docs/ARCHITECTURE.md).
 import type { Currency, PolicyDecision, PurchaseState, PurchaseStateReason, Verdict, VerificationRecord } from "@writ/core";
+import { HttpError } from "../http/errors";
 import type { TxContext } from "../tx/unit-of-work";
 
 /** Read model of one purchase (what the pipeline and the routes need; hashes as lowercase hex). */
@@ -53,6 +54,16 @@ export interface OpenPurchaseInput {
 
 export type BlockReason = Extract<PurchaseStateReason, "policy_blocked" | "budget_exhausted">;
 export type VoidRequestReason = Extract<PurchaseStateReason, "kill_switch" | "writ_revoked" | "writ_expired">;
+
+/**
+ * beginVerification or execute found the purchase already moved by recovery or the kill switch.
+ * The pipeline stops and reports `current`; it never forces a transition (409 state_changed).
+ */
+export class PurchaseStateChangedError extends HttpError {
+  constructor(readonly current: PurchaseSnapshot) {
+    super(409, "state_changed", `The purchase is ${current.state}: it was moved while this request was running.`);
+  }
+}
 
 export interface PurchaseSaga {
   /**
@@ -98,6 +109,9 @@ export interface PurchaseSaga {
 
   /** Inside the dispute engine's transaction: DISPUTED → DISPUTE_WON | DISPUTE_LOST (+ DISPUTE_RESOLVED). */
   resolveDispute(ctx: TxContext, input: { purchaseId: string; paypalDisputeId: string; outcome: "WON" | "LOST" }): Promise<void>;
+
+  /** Inside the caller's transaction (platform liability): enqueue a refund of a CAPTURED purchase. */
+  requestRefund(ctx: TxContext, input: { purchaseId: string; reason: Extract<PurchaseStateReason, "platform_liability"> }): Promise<void>;
 
   get(input: { tenantId: string; purchaseId: string }): Promise<PurchaseSnapshot | null>;
 }

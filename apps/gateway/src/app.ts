@@ -31,6 +31,7 @@ import { InMemoryWebhookDedupe, paypalWebhookVerifier, webhookRoutes, type Webho
 import { writRoutes } from "./routes/writs";
 import { createServices } from "./services";
 import { passkeySpikePlugin } from "./spikes/passkey";
+import { durableWebhookDedupe } from "./webhooks/index";
 
 export interface GatewayDeps {
   /** undefined: PayPal postback verifier built from config; null: none (deliveries get 503). */
@@ -88,7 +89,7 @@ export async function buildApp(config: GatewayConfig, deps: GatewayDeps = {}): P
   await app.register(metaRoutes);
   await app.register(webhookRoutes, {
     verifier,
-    dedupe: deps.webhookDedupe ?? new InMemoryWebhookDedupe(),
+    dedupe: deps.webhookDedupe ?? (deps.db ? durableWebhookDedupe(services) : new InMemoryWebhookDedupe()),
     exposeRecent: config.enableSpikes,
   });
   for (const plugin of STREAM_ROUTES) await app.register(plugin);

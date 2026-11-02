@@ -1,6 +1,6 @@
-// POST /v1/webhooks/paypal: the first half of P0-8 (plan §6.8). Keep the raw body, verify the
-// signature with PayPal's postback API, dedupe by event id, log, acknowledge. Events are NOT acted on
-// yet: P0-8 adds the webhook_events insert and a handler that re-fetches the resource from PayPal.
+// POST /v1/webhooks/paypal (P0-8, plan §6.8). Keep the raw body, verify the signature with PayPal's
+// postback API, dedupe by event id, store and enqueue (src/webhooks), acknowledge. The job handler
+// re-fetches the resource from PayPal before anything changes (§22 rule 15).
 // Anything short of a SUCCESS verification gets a non-2xx answer, so a spoofed event (threat T11)
 // is never acknowledged and a genuine one is retried by PayPal (up to 25 times over 3 days).
 import {
@@ -11,6 +11,7 @@ import {
   verifyWebhookSignature,
   webhookResourceId,
   type PayPalHttp,
+  type WebhookEvent,
   type TransmissionHeaders,
   type WebhookVerification,
 } from "@writ/paypal";
@@ -39,13 +40,14 @@ export function paypalWebhookVerifier(http: PayPalHttp, webhookId: string): Webh
 }
 
 export interface WebhookDedupe {
-  has(eventId: string): boolean;
-  add(eventId: string): void;
+  has(eventId: string): boolean | Promise<boolean>;
+  /** Called once, after a SUCCESS verification. A rejection answers 503 so PayPal delivers again. */
+  add(eventId: string, event: WebhookEvent): void | Promise<void>;
 }
 
 /**
- * SPIKE ONLY: in-memory dedupe by event id. Lost on restart and not shared between instances; the
- * durable dedupe is the webhook_events table (paypal_event_id primary key) that lands with P0-8.
+ * In-memory dedupe by event id, for a gateway with no database (spikes and tests). With a database the
+ * durable webhook_events store in src/webhooks is used instead.
  */
 export class InMemoryWebhookDedupe implements WebhookDedupe {
   readonly #seen = new Map<string, true>();
@@ -154,7 +156,7 @@ export const webhookRoutes: FastifyPluginAsync<WebhookRoutesOptions> = async (ap
       transmission_id: headers.transmissionId,
     };
 
-    if (options.dedupe.has(event.id)) {
+    if (await options.dedupe.has(event.id)) {
       delivery.outcome = "duplicate";
       request.log.info({ webhook: summary }, "paypal webhook duplicate: already verified, not reprocessed");
       return finish(200, { received: true, duplicate: true, event_id: event.id });
@@ -197,12 +199,19 @@ export const webhookRoutes: FastifyPluginAsync<WebhookRoutesOptions> = async (ap
     }
 
     // A concurrent delivery of the same event may have been verified while this one waited.
-    if (options.dedupe.has(event.id)) {
+    if (await options.dedupe.has(event.id)) {
       delivery.outcome = "duplicate";
       request.log.info({ webhook: logged }, "paypal webhook duplicate: already verified, not reprocessed");
       return finish(200, { received: true, duplicate: true, event_id: event.id });
     }
-    options.dedupe.add(event.id);
+    try {
+      await options.dedupe.add(event.id, event);
+    } catch (error) {
+      delivery.outcome = "unavailable";
+      delivery.reason = "could not store the verified event";
+      request.log.error({ webhook: logged, err: error }, "paypal webhook verified but not stored (PayPal will retry)");
+      return finish(503, { error: "webhook_store_unavailable" });
+    }
     delivery.outcome = "verified";
     request.log.info({ webhook: logged }, "paypal webhook verification SUCCESS");
     return finish(200, { received: true, event_id: event.id, verification_status: "SUCCESS" });

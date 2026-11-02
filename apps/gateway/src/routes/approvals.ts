@@ -1,16 +1,32 @@
 // Human review: list, challenge, decide with a passkey (P0-6).
-// Owner: money stream. Paths and auth are frozen in routes/table.ts; bodies are the named
-// @writ/core/api schemas. Every route answers 501 not_implemented until the owner fills it in.
+import { ApprovalStatusSchema, idSchema } from "@writ/core";
+import { DecideApprovalRequestSchema } from "@writ/core/api";
 import type { FastifyPluginAsync } from "fastify";
-import { notImplemented } from "../http/errors";
+import { z } from "zod";
+import { approvalChallenge, decideApproval, listApprovals } from "../approvals/index";
+import { sessionOf } from "../auth/guards";
+import { parseWith } from "../http/errors";
 
-const OWNER = "money";
+const IdParams = z.strictObject({ id: idSchema("apr") });
+const ListQuery = z.strictObject({ status: ApprovalStatusSchema.optional() });
 
 export const approvalRoutes: FastifyPluginAsync = async (app) => {
-  // session → ListApprovalsResponse
-  app.get("/v1/approvals", notImplemented(OWNER, "GET /v1/approvals"));
-  // session → ApprovalChallengeResponse
-  app.get("/v1/approvals/:id", notImplemented(OWNER, "GET /v1/approvals/:id"));
-  // session → DecideApprovalResponse
-  app.post("/v1/approvals/:id/decide", notImplemented(OWNER, "POST /v1/approvals/:id/decide"));
+  app.get("/v1/approvals", async (request) => {
+    const session = sessionOf(request);
+    const query = parseWith(ListQuery, request.query, "query");
+    return { approvals: await listApprovals(app.services, session.tenantId, query.status) };
+  });
+
+  app.get("/v1/approvals/:id", async (request) => {
+    const session = sessionOf(request);
+    const { id } = parseWith(IdParams, request.params, "path");
+    return approvalChallenge(app.services, session.tenantId, session.userId, id);
+  });
+
+  app.post("/v1/approvals/:id/decide", async (request) => {
+    const session = sessionOf(request);
+    const { id } = parseWith(IdParams, request.params, "path");
+    const body = parseWith(DecideApprovalRequestSchema, request.body);
+    return decideApproval(app.services, { tenantId: session.tenantId, userId: session.userId, approvalId: id, decision: body.decision, signature: body.signature });
+  });
 };
