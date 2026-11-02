@@ -226,7 +226,7 @@ flowchart LR
     API["REST API + SSE"]
     MCPS["writ-mcp (Streamable HTTP)"]
     PIPE["Decision pipeline: policy, reserve, authorize, sentinel, verifier, combiner"]
-    SAGA["Payment saga + recovery jobs (pg-boss)"]
+    SAGA["Payment saga + outbox job poller + 30 s recovery"]
     LED["Evidence ledger (hash chain)"]
     DSP["Dispute engine"]
     WH["PayPal webhook receiver"]
@@ -254,6 +254,8 @@ flowchart LR
   GW --- DB
 ```
 
+Runtime shape (decisions of Nov 1, §6.9): the browser talks only to the Wallet origin, which rewrites `/gw/*` to the gateway; Atlas and Scout run as background runs inside the gateway process but reach it only through the public agent API with their own key, like any external agent; durable jobs are the `outbox` table plus an in-process poller, not pg-boss. Module boundaries, file ownership and every cross-stream contract: `docs/ARCHITECTURE.md`.
+
 ### 6.2 Decision pipeline (ordered, fail-closed)
 1. **Schema** — Zod-parse the cart; reject unknown fields. Contract: `CartSchema` (`writ-cart/0.1`, `packages/core/src/cart.ts`), strict, no payee field anywhere; the declared `total_minor` must equal Σ unit×qty + shipping + tax (bigint) and each `product_ref` appears on one line only.
 2. **Writ validity** — signature verifies, status ACTIVE, not expired/revoked, the agent is bound to this Writ.
@@ -273,22 +275,27 @@ flowchart LR
 8. **Combiner** — `final = max(policy, threshold, sentinel, verifier)` with BLOCK > REVIEW > APPROVE. An LLM can move a decision **up, never down**. Verifier timeout/parse failure → REVIEW. The combiner re-validates its inputs: a malformed or inconsistent policy decision → BLOCK; the verifier answer must judge exactly the cart's lines (`cart_product_refs`; a skipped or invented line → REVIEW); a null or malformed signal → REVIEW.
 9. **Execute** — APPROVE → capture · REVIEW → human passkey → capture or void · BLOCK → void. Convert or release the reservation.
 
+10. **After a policy BLOCK** the deterministic Sentinel rules (no model, no LLM budget) still scan the cart's sources, so the injected text can be shown in red and an `attacks` row recorded (hero scenes 5-6). The scan can never change the BLOCK.
+
 ### 6.3 Purchase state machine
 ```mermaid
 stateDiagram-v2
   [*] --> PROPOSED
-  PROPOSED --> BLOCKED: policy fail
+  PROPOSED --> BLOCKED: policy fail or budget exhausted
   PROPOSED --> RESERVED: policy pass
   RESERVED --> AUTHORIZING
+  RESERVED --> FAILED: PayPal unconfigured or no vaulted wallet, release reservation
   AUTHORIZING --> AUTHORIZED
   AUTHORIZING --> FAILED: PayPal error, release reservation
   AUTHORIZED --> VERIFYING
+  AUTHORIZED --> VOIDING: kill switch, revoke or expiry
   VERIFYING --> CAPTURING: APPROVE
   VERIFYING --> AWAITING_HUMAN: REVIEW
   VERIFYING --> VOIDING: BLOCK
   AWAITING_HUMAN --> CAPTURING: approved with passkey
   AWAITING_HUMAN --> VOIDING: declined or 24h timeout
   CAPTURING --> CAPTURED
+  CAPTURING --> VOIDING: capture permanently refused, settlement reversed
   VOIDING --> VOIDED
   CAPTURED --> REFUNDED: platform liability
   CAPTURED --> DISPUTED
@@ -298,6 +305,7 @@ stateDiagram-v2
   VOIDED --> [*]
   FAILED --> [*]
 ```
+The edges are data in `packages/core/src/purchase.ts` (`PURCHASE_TRANSITIONS`, with typed `state_reason` codes such as `policy_blocked`, `budget_exhausted`, `paypal_unconfigured`, `kill_switch`, `capture_failed`); only the saga moves a purchase, one transaction per edge (§22 rule 14). Added on Nov 1 for the parallel build: `RESERVED → FAILED` (decision 8: nothing to authorize with), `AUTHORIZED → VOIDING` (kill switch or revoke before verification starts) and `CAPTURING → VOIDING` (PayPal permanently refused the capture: void the authorization, reverse the settlement). Per-edge ledger events, outbox topics and PayPal calls: `docs/ARCHITECTURE.md` §5.
 
 ### 6.4 Sequences
 **Two-key purchase**
@@ -359,35 +367,56 @@ sequenceDiagram
 
 ### 6.5 Data model (Postgres; every table has `tenant_id` for judge-mode isolation and `created_at`)
 ```text
-users(id, display_name)
-passkeys(id, user_id, credential_id UNIQUE, public_key_cose BYTEA, counter BIGINT, transports TEXT[])
-device_keys(id, user_id, public_key_ed25519 BYTEA)            -- fallback signer
-paypal_vault_tokens(id, user_id, vault_id, paypal_customer_id, status)
+users(id, display_name, demo)                                     -- demo = seeded judge-mode Ana (labeled)
+passkeys(id, user_id, credential_id UNIQUE, public_key_cose BYTEA, counter BIGINT, transports TEXT[],
+         aaguid, backed_up, last_used_at)
+device_keys(id, user_id, public_key_ed25519 BYTEA, label, demo, revoked_at)   -- fallback signer; demo = the labeled judge key
+paypal_vault_tokens(id, user_id, vault_id NULL, paypal_customer_id, status, setup_token_id UNIQUE, payer_hint, demo, updated_at)
+                                   -- status CHECK IN (PENDING, ACTIVE, REVOKED, FAILED); ACTIVE requires vault_id
 address_book(id, user_id, label, line1, city, region, postal, country)  -- agents only ever see id + label
-agents(id, user_id, name, kind IN ('builtin','mcp','sdk'), api_key_hash, revoked_at)
-writs(id, user_id, agent_id, body JSONB, body_hash BYTEA, signature JSONB, status, expires_at)
+agents(id, user_id, name, kind IN ('builtin','mcp','sdk'), builtin_kind IN ('atlas','scout'), api_key_hash, key_hint,
+       last_used_at, revoked_at)   -- builtin_kind set exactly when kind = 'builtin'
+writs(id, user_id, agent_id, body JSONB, body_hash BYTEA, signature JSONB, status, expires_at,
+      signed_at, revoked_at, revoke_reason, synthetic)
                                    -- body = WritBody (writ/0.1, every key present, explicit nulls); body_hash = sha256(JCS(body))
                                    -- = WebAuthn challenge; status CHECK IN (DRAFT, ACTIVE, REVOKED, EXPIRED)
 writ_budgets(writ_id PK, limit_minor BIGINT, max_per_order_minor BIGINT, reserved_minor BIGINT,
-             spent_minor BIGINT, orders_count INT, max_orders INT, version INT)
-                                   -- CHECK reserved >= 0, spent >= 0, spent + reserved <= limit, 0 <= orders_count <= max_orders
+             spent_minor BIGINT, orders_count INT, held_orders INT, max_orders INT, version INT)
+                                   -- CHECK reserved >= 0, spent >= 0, spent + reserved <= limit, 0 <= orders_count <= max_orders,
+                                   -- held_orders >= 0, orders_count + held_orders <= max_orders (held_orders: §6.8)
 carts(id, writ_id, agent_id, body JSONB, body_hash BYTEA, sources JSONB)   -- sources = tainted inputs: CartSource[] <= 50
                                    -- {url, kind: page|search_result|listing, fetched_at, product_ref|null}; not part of H_c
-decisions(id, cart_id, stage, verdict, reasons JSONB, model, latency_ms, tokens)
+decisions(id, cart_id, purchase_id NULL, stage, verdict, reasons JSONB, output JSONB, output_hash BYTEA, model, latency_ms, tokens)
+                                   -- one row per pipeline stage: stage CHECK IN (preview, schema, policy, threshold, reserve,
+                                   -- authorize, sentinel, verifier, combiner, human); output = PolicyDecision (hash H_p) or
+                                   -- VerificationRecord (hash H_verifier)
 purchases(id, writ_id, cart_id, agent_id, state, amount_minor BIGINT, currency, idempotency_key,
           paypal_order_id UNIQUE, authorization_id UNIQUE, capture_id UNIQUE, refund_id UNIQUE,
-          c_pre BYTEA, c_post BYTEA, updated_at)   -- UNIQUE(agent_id, idempotency_key) (T7); CHECK state IN the §6.3 states;
+          c_pre BYTEA, c_post BYTEA, state_reason, state_detail, final_verdict, vault_token_id, synthetic, updated_at)
+                                   -- UNIQUE(agent_id, idempotency_key) (T7); CHECK state IN the §6.3 states;
                                    -- updated_at lets the recovery job find stuck sagas
-approvals(id, purchase_id, status, expires_at, assertion JSONB, decided_at)
+approvals(id, purchase_id UNIQUE, status, request JSONB, decision, body_hash BYTEA, expires_at, assertion JSONB, decided_at)
+                                   -- body_hash = the passkey challenge for the decision (@writ/core approval.ts)
 ledger_events(seq BIGSERIAL, purchase_id NULL, writ_id, type, payload JSONB, ts TEXT, prev_hash BYTEA, hash BYTEA UNIQUE)
                                    -- UNIQUE(writ_id, prev_hash): a chain cannot fork; ts = the exact hashed ISO string
-disputes(id, paypal_dispute_id UNIQUE, purchase_id, reason, status, stage, analysis JSONB, action, outcome)
-webhook_events(paypal_event_id PK, type, payload JSONB, verified BOOL, processed_at)
-attacks(id, source_url, category, spans JSONB, cart_id, agent_id)
-outbox(id, topic, payload JSONB, published_at)
+disputes(id, paypal_dispute_id UNIQUE, purchase_id, reason, status, stage, analysis JSONB, action, outcome,
+         liability, confidence, needs_human, amount_minor BIGINT, currency, paypal_snapshot JSONB, resolved_at, synthetic, updated_at)
+webhook_events(paypal_event_id PK, type, resource_type, resource_id, payload JSONB, verified BOOL, processed_at, error)
+attacks(id, source_url, category, spans JSONB, score, detector, cart_id, purchase_id, writ_id, agent_id, synthetic)
+outbox(id, topic, payload JSONB, dedupe_key UNIQUE, attempts, available_at, locked_until, last_error, dead_at, published_at)
+                                   -- the durable job queue (§6.9 decision 3)
+auth_challenges(id, user_id NULL, purpose IN (register, login), challenge BYTEA, context JSONB, expires_at, consumed_at)
+agent_runs(id, user_id, agent_id, writ_id, agent_kind, mode, status, goal, failure_code, failure_detail, purchase_id,
+           steps, tokens, started_at, finished_at, updated_at)    -- built-in Atlas/Scout runs (§6.9 decision 6)
+agent_run_events(run_id, seq, type, payload JSONB)  PK(run_id, seq)  -- the live run timeline
+evidence_links(id, purchase_id, token_hash BYTEA UNIQUE, expires_at, revoked_at, last_accessed_at)  -- capability links
+catalog_items(id, product_ref, source IN (channel3, fixture), title, merchant_id, merchant_name, category, kind,
+              price_minor BIGINT, currency, eta_days, url, image_url, raw JSONB, fetched_at)  UNIQUE(tenant_id, product_ref)
+rate_counters(tenant_id, bucket, window_start, count)  PK(tenant_id, bucket, window_start)  -- judge-mode limits
 ```
-- Primary keys are `@writ/core` ULID ids (`<prefix>_<26 base32>`). Rows a signed document can reference use core prefixes (`usr`, `adr`, `agt`, `wr`, `crt`, `pur`, `apr`); gateway-only rows use `psk`, `dvk`, `vlt`, `dec`, `dsp`, `atk`, `obx`. Exceptions: `ledger_events.seq`, `webhook_events.paypal_event_id`.
-- Every hash/key `bytea` column has CHECK `octet_length = 32`. Schema: `apps/gateway/src/db/schema.ts`; migrations in `apps/gateway/drizzle/`.
+- Primary keys are `@writ/core` ULID ids (`<prefix>_<26 base32>`). Rows a signed document can reference use core prefixes (`usr`, `adr`, `agt`, `wr`, `crt`, `pur`, `apr`); gateway-only rows use `psk`, `dvk`, `vlt`, `dec`, `dsp`, `atk`, `obx`, `chl`, `run`, `evl`, `cat`; tenant ids are `tn_<ULID>` (minted per wallet and per judge visitor; no tenants table). Exceptions: `ledger_events.seq`, `webhook_events.paypal_event_id`, the composite keys of `agent_run_events` and `rate_counters`.
+- PayPal ids (`purchases.paypal_order_id`, `authorization_id`, `capture_id`, `refund_id`, `disputes.paypal_dispute_id`, `paypal_vault_tokens.vault_id`) are unique through partial indexes that exclude seeded rows (`synthetic = false`, `demo = false`), so every judge tenant can hold the labeled demo token and synthetic history. `purchases.state_reason` has a CHECK on `PURCHASE_STATE_REASONS`.
+- Every hash/key `bytea` column has CHECK `octet_length = 32`. Schema: `apps/gateway/src/db/schema.ts`; migrations in `apps/gateway/drizzle/` (`0002_p0_contracts`, Nov 1, is additive: new tables, nullable or defaulted columns, CHECKs on tables that were still empty). No build stream changes the schema after it (`docs/ARCHITECTURE.md` §12).
 
 ### 6.6 Gateway API
 | Method & path | Caller | Purpose |
@@ -396,22 +425,30 @@ outbox(id, topic, payload JSONB, published_at)
 | `POST /v1/writs` | Wallet | store draft (server-generated id) → canonical body + hash (= WebAuthn challenge, single-use, consumed by `/sign`) |
 | `POST /v1/writs/:id/sign` | Wallet | WebAuthn assertion → ACTIVE |
 | `POST /v1/writs/:id/revoke`, `POST /v1/kill-switch` | Wallet | revoke one / all (+ void in-flight authorizations) |
-| `POST /v1/paypal/vault/*` | Wallet | connect PayPal (exact endpoints decided in S1) |
+| `POST /v1/auth/register/{options,verify}`, `POST /v1/auth/login/{options,verify}`, `POST /v1/auth/logout`, `GET /v1/me` | Wallet | passkey registration and sign-in → session cookie (§6.9 decision 5) |
+| `GET /v1/meta` | Wallet | what this gateway can do right now (AI roles, PayPal, Channel3, WebAuthn), so the UI degrades visibly |
+| `GET /v1/paypal/config`, `GET /v1/paypal/vault`, `POST /v1/paypal/vault/{setup-token,payment-token,disconnect}` | Wallet | connect PayPal once (JS SDK v6 save flow, approve-URL fallback) |
 | `POST /v1/agents` | Wallet | create agent + key (shown once) |
 | `GET /v1/agent/writs[/:id]` | Agent | constraints to plan within |
 | `POST /v1/agent/search` | Agent | Channel3 proxy, typed results |
 | `POST /v1/agent/carts` | Agent | propose cart → policy preview |
 | `POST /v1/agent/checkout` | Agent | run pipeline (`Idempotency-Key` required) |
-| `GET /v1/purchases/:id`, `GET /v1/stream` (SSE) | Wallet/Console | live state |
-| `POST /v1/approvals/:id/decide` | Wallet | passkey approve/decline |
+| `GET /v1/purchases[/:id]`, `GET /v1/stream` (SSE) | Wallet/Console | live state |
+| `GET /v1/approvals[/:id]`, `POST /v1/approvals/:id/decide` | Wallet | the approval request and its challenges; passkey approve/decline |
+| `POST /v1/runs`, `GET /v1/runs[/:id]`, `POST /v1/runs/:id/stop` | Wallet | start and watch a built-in Atlas/Scout run (§6.9 decision 6) |
+| `GET /v1/receipts/:purchaseId`, `POST /v1/evidence-links` | Wallet | receipt data; mint a capability link to the evidence pack |
 | `GET /v1/evidence/:capabilityToken(.json/.pdf)` | Anyone with the link | evidence pack |
+| `GET /v1/disputes[/:id]`, `POST /v1/disputes/:id/actions` | Wallet/Console | dispute status; the human click for anything not auto-executed |
 | `POST /v1/webhooks/paypal` | PayPal | events |
-| `GET /api/console/datasets/:name`, `POST /api/console/query` | Console | AG Studio data (constrained filter DSL, no raw SQL) |
+| `GET /api/console/datasets/:name`, `POST /api/console/query`, `POST /api/ai/studio` | Console | AG Studio data (constrained filter DSL, no raw SQL); AI harness proxy |
+| `POST /v1/demo/session`, `GET /v1/demo/status` | Judge mode | isolated judge tenant (cookie); remaining limits |
 | `POST /v1/demo/hero-run`, `POST /v1/demo/disputes/:purchaseId/simulate` | Judge mode | sandbox-only helpers |
-| `/mcp` | MCP clients | writ-mcp |
+| `/mcp` | MCP clients | writ-mcp (P1-1) |
 | `GET /.well-known/writ-jwks.json` | Anyone | gateway attestation keys (P1-7) |
 
-**Passkeys and hosts (found in S6 prep).** `onrender.com` is on the Public Suffix List, so `writ-web.onrender.com` and `writ-gateway.onrender.com` cannot share a parent RP ID and a passkey made on one cannot be used on the other. WebAuthn ceremonies run on the Wallet origin (`APP_BASE_URL`, RP ID = Wallet host); the gateway only verifies, with `expectedOrigin = APP_BASE_URL` and `expectedRPID = WEBAUTHN_RP_ID`. The challenge is the 32 raw bytes of the hash (`@simplewebauthn/server` UTF-8-encodes string challenges), verified with `expectedChallenge = base64url(hash)` and `requireUserVerification: true`. Verification lives on the `@writ/core/signatures` subpath so the Wallet bundle never pulls in server code.
+The complete table (auth, request/response schema and owning build stream per route) is `apps/gateway/src/routes/table.ts`, mirrored in `docs/ARCHITECTURE.md` §4 and asserted by `apps/gateway/test/routes.test.ts`; bodies are the Zod schemas in `@writ/core/api`.
+
+**Passkeys and hosts (found in S6 prep, decided Nov 1).** `onrender.com` is on the Public Suffix List, so `writ-web.onrender.com` and `writ-gateway.onrender.com` cannot share a parent RP ID and a passkey made on one cannot be used on the other. Every WebAuthn ceremony (registration, sign-in, Writ signing, approvals) runs in the Wallet on its origin (`APP_BASE_URL`, RP ID = Wallet host, `localhost` locally); the gateway only verifies, with `expectedOrigin = APP_BASE_URL` and `expectedRPID = WEBAUTHN_RP_ID`. The browser only ever talks to the Wallet origin: Next.js rewrites `/gw/:path*` to `GATEWAY_BASE_URL`, so the session cookie is first-party on the Wallet host. Agents call the gateway directly. The challenge is the 32 raw bytes of the hash (`@simplewebauthn/server` UTF-8-encodes string challenges), verified with `expectedChallenge = base64url(hash)` and `requireUserVerification: true`. Verification lives on the `@writ/core/signatures` subpath so the Wallet bundle never pulls in server code.
 
 ### 6.7 Evidence and PayPal anchoring
 - `H_w = sha256(JCS(writ))`, `H_c = sha256(JCS(cart))`, `H_p = sha256(JCS(policy_decision))`.
@@ -420,30 +457,46 @@ outbox(id, topic, payload JSONB, published_at)
 - Ledger: one hash chain **per Writ**, starting with its `WRIT_SIGNED` event, so an evidence pack is self-contained. `hash_i = sha256(prev_hash ‖ u32be(len) ‖ type ‖ u32be(len) ‖ JCS(payload) ‖ u32be(len) ‖ ts)`: prev_hash is 32 raw bytes (genesis: 32 zero bytes), each variable-length field is length-prefixed so the concatenation is unambiguous, `ts` is ISO 8601 UTC with exactly 3 fractional digits and is stored verbatim in `ledger_events.ts`. `seq`, `writ_id` and `purchase_id` are bound through `prev_hash` and the payloads, not hashed directly. Golden vector: `packages/ledger/test/chain.test.ts`.
 - PayPal ledger events carry the full commitments next to the truncated anchors: `PAYPAL_ORDER_CREATED {order_id, custom_id, c_pre, …}`, `PAYPAL_CAPTURED {capture_id, c_post, invoice_id, …}`, `PAYPAL_VOIDED {authorization_id, c_post | null, …}`; C_post is also computed for a void after the verifier ran, so the void path and the S8 fallback still bind the verifier and approval records.
 - `jcs` rejects anything that is not I-JSON (lone surrogates, array holes, undefined, bigint, non-finite numbers), so non-JS verifiers can reproduce every hash.
+- H_approval: the `human` decisions row stores the exact `ApprovalRecord` as `output` and H_approval as `output_hash`; evidence reads the record only from there. No signed decision (expired, or no review) means H_approval = 32 zero bytes.
+- Stored signatures: the passkey counter check applies to live ceremonies only (sign, approve, sign-in). Checkout and receipt re-verification use `verifyStoredWritSignature`, which checks the signature over the recomputed hash and skips the counter.
 - Evidence pack: all ledger events, the Writ, the WebAuthn assertion (authenticatorData, clientDataJSON, signature, COSE public key), PayPal order/authorization/capture IDs and `PayPal-Debug-Id`s, tracking, verifier record, human-readable PDF summary.
 - Evidence pack JSON (`writ-evidence/0.1`, `packages/ledger/src/evidence.ts`): `verifyEvidencePack` runs named PASS/FAIL/SKIP checks (chain, writ hash, H_c, H_p, C_pre, custom_id, H_verifier, H_approval, C_post, invoice_id, PayPal ids/anchors/amounts, `committed_amount`: cart total and policy amount must equal the captured amount, …).
 - `writ-verify` (P1-5): recompute every hash, verify the WebAuthn signature with the embedded public key, re-run the deterministic policy, compare commitments to the PayPal order/capture. "Don't trust us — verify." A pack re-forged consistently end to end passes every offline check, so writ-verify MUST also GET the PayPal order and capture and compare `custom_id`/`invoice_id`; it must require the signature check (no SKIP) and an approval record for a REVIEW decision.
 
 ### 6.8 Correctness (where the distributed-systems credibility comes from)
 - Money = integer minor units (`bigint` in TS and Postgres). Never floats. Format only at the UI edge.
-- Atomic reservation — one statement, no race:
+- Atomic reservation — one statement, no race; a reservation also holds one order slot (`held_orders`):
 ```sql
 UPDATE writ_budgets
-SET reserved_minor = reserved_minor + $1, version = version + 1
+SET reserved_minor = reserved_minor + $1, held_orders = held_orders + 1, version = version + 1
 WHERE writ_id = $2
   AND spent_minor + reserved_minor + $1 <= limit_minor
-  AND orders_count < max_orders
+  AND orders_count + held_orders < max_orders
 RETURNING *;
 ```
-  Implemented with the overflow-safe equivalent `$1 <= limit_minor - spent_minor - reserved_minor` (`apps/gateway/src/budget/reservations.ts`). Settle (reserved → spent, +1 order; guarded by `reserved_minor >= $1 AND orders_count < max_orders`) runs in the same transaction as the move to CAPTURING, before the PayPal capture call; if its guard fails the purchase goes to VOIDING. Void/failure releases the hold (guarded by `reserved_minor >= $1`). Settle/release are not idempotent per purchase: each must ride on a guarded purchase state change in the same transaction.
-  **Open decision:** the reservation counts only settled orders, so with `max_orders = 1` two concurrent checkouts can both reserve and both AUTHORIZE; the second settle fails and that purchase is voided. Money never exceeds the limit, but the buyer briefly sees an extra hold. Fix if it matters for T7: `held_orders INT` with reserve guard `orders_count + held_orders < max_orders`.
+  Implemented with the overflow-safe equivalent `$1 <= limit_minor - spent_minor - reserved_minor` (`apps/gateway/src/budget/reservations.ts`). Settle moves the hold to a capture (reserved → spent, one held order → `orders_count`; guarded by `reserved_minor >= $1 AND held_orders >= 1`) and runs in the same transaction as the move to CAPTURING, before the PayPal capture call; if its guard fails the purchase goes to VOIDING. Void/failure releases the hold and its slot (guarded by `reserved_minor >= $1 AND held_orders >= 1`). A capture PayPal permanently refuses after settlement is reversed (`reverseSettlement`: `spent_minor − $1`, `orders_count − 1`; no money moved; never used for refunds, refunded money stays spent). Settle/release are not idempotent per purchase: each must ride on a guarded purchase state change in the same transaction. The policy engine sees `orders_count + held_orders` as the order count. DB CHECKs: `held_orders >= 0`, `orders_count + held_orders <= max_orders`.
+  **`held_orders` adopted (Nov 1, was the open decision here):** counting only settled orders let two concurrent checkouts on a `max_orders = 1` Writ both reserve and both AUTHORIZE, the second being voided after the fact (money never exceeded the limit, but the buyer briefly saw an extra hold). Now in-flight orders count too: with `max_orders = 1`, two concurrent checkouts yield exactly one reservation and the other is a BLOCK (budget) before any PayPal call (property-tested in `apps/gateway/test/reservation.test.ts`).
+- Checkout timing (`packages/core/src/checkout.ts`): PROPOSED → RESERVED → AUTHORIZING (or → FAILED/BLOCKED) commit in one transaction. The pipeline has `PIPELINE_DEADLINE_MS` (45 s) for Sentinel + Verifier and then fails closed; recovery moves anything left in PROPOSED/RESERVED/AUTHORIZED/VERIFYING after `STALLED_PIPELINE_MS` (120 s) to BLOCKED/FAILED/VOIDING, so a funds hold can never be orphaned. `beginVerification` and `execute` answer 409 `state_changed` when recovery or the kill switch moved the purchase first.
 - Idempotency: agent `Idempotency-Key` → unique `(agent_id, key)`; PayPal `PayPal-Request-Id = <purchase_id>:<step>` (capped at 108 chars, the Vault v3 limit). The OAuth token POST gets a fresh `oauth:<uuid>` so a retry is never handed a stored, possibly expired token.
-- Saga: state change + ledger event + outbox row in one DB transaction; PayPal calls happen after commit and are idempotent; a recovery job (every 30 s) resumes purchases stuck in AUTHORIZING / CAPTURING / VOIDING.
+- Saga: state change + ledger event + outbox row in one DB transaction (the gateway's unit of work, `apps/gateway/src/tx/unit-of-work.ts`); PayPal calls happen after commit, in outbox job handlers, and are idempotent; a recovery job (every 30 s) resumes purchases stuck in AUTHORIZING / CAPTURING / VOIDING with the same `PayPal-Request-Id`, and fails a VERIFYING purchase whose process died closed to VOIDING.
+- Durable jobs (decided Nov 1, replaces pg-boss): the `outbox` table is the queue. An in-process poller claims due rows (`published_at IS NULL AND dead_at IS NULL AND available_at <= now()` and no live lease) with `FOR UPDATE SKIP LOCKED`, leases them (`locked_until`, `attempts`), runs the topic's handler outside the claim transaction, then marks the row published, retries it with exponential backoff (`available_at`) or sets `dead_at`. Handlers are idempotent (a crash after a handler's commit runs it again). Works the same on Postgres and PGlite; topics and payload schemas: `apps/gateway/src/contracts/jobs.ts`.
 - Webhooks: verify → insert by `event.id` (unique) → enqueue → handler re-fetches from PayPal before acting. Verification posts the event back exactly as received (number text preserved) with `PayPal-Request-Id = wh-verify:<transmission_id>:<24 hex of sha256(request)>`, so a forged body never gets a stored answer. Anything short of SUCCESS gets a non-2xx (400 FAILURE or missing headers, 503 unconfigured or PayPal error) and PayPal retries.
 - PayPal OAuth token cached, refreshed at `expires_in − 120 s`, single-flight.
 - Timeouts: PayPal 15 s; verifier 20 s with one fallback provider; timeout → REVIEW.
-- **Property test** (fast-check): 50 concurrent checkouts on a $100 Writ never exceed $100 captured + reserved.
+- **Property test** (fast-check): 50 concurrent checkouts on a $100 Writ never exceed $100 captured + reserved; with `max_orders = 1`, concurrent checkouts yield exactly one reservation.
 - **Chaos test**: kill the gateway between AUTHORIZE and CAPTURE → on restart the saga captures or voids; never double-captures.
+
+### 6.9 Implementation decisions for the parallel P0 build (Nov 1)
+P0 is built by parallel streams in one working tree, each owning disjoint files. `docs/ARCHITECTURE.md` freezes the module map, the file ownership, every cross-stream contract (TypeScript signatures with file locations), the route table, the saga transition table, the outbox topics and job handlers, the SSE events, auth/tenants/keys, the AI wiring and degradation, the local run and environment, and every dependency added with its reason (rule 40). New workspace packages: `packages/agents` (`@writ/agents`: Atlas, Scout, the typed agent-API client, the page reader) and `evals` (`@writ/evals`: WritBench). Decisions taken by the owner:
+1. **`held_orders` adopted** (§6.8, §6.5): in-flight orders count against `max_orders`.
+2. **One browser origin; passkeys on the Wallet host** (§6.6): every WebAuthn ceremony (registration, sign-in, Writ signing, approvals) runs in the Wallet on `APP_BASE_URL` with RP ID = the Wallet host (`localhost` locally); the gateway only verifies, with `expectedOrigin = APP_BASE_URL` and `expectedRPID = WEBAUTHN_RP_ID`. The browser only talks to the Wallet origin: Next.js rewrites `/gw/:path*` to `GATEWAY_BASE_URL`, so session cookies are first-party on the Wallet host. Agents call the gateway directly.
+3. **Durable jobs = outbox + in-process poller**, not pg-boss (§6.1, §6.8, §14): `FOR UPDATE SKIP LOCKED` claims under a lease, retries with backoff, idempotent handlers; works on PGlite too.
+4. **Local runs need no external services**: `DATABASE_URL=pglite:<dir>` (file-backed PGlite, migrations at startup, `.data/` git-ignored; `pglite:memory` for tests and evals) or `postgres://…`; production (`APP_ENV=production`, or `RENDER=true`) requires `postgres://`. `pnpm dev` starts the gateway (`:10000`) and the Wallet (`:3000`) on PGlite; `pnpm smoke:local` checks the local run over HTTP.
+5. **Sessions**: an HMAC-SHA256-signed, HttpOnly, SameSite=Lax cookie carrying user id, tenant id, kind (wallet or judge), issued-at and expiry (7 days; 24 h for judge visitors), Secure on https. `SESSION_SECRET` (≥ 32 chars) is required in production; development generates an ephemeral random secret and logs a loud warning. An unsafe request whose `Origin` is not the Wallet is treated as anonymous (CSRF). Every query is scoped to the tenant from the session or the agent key, never to a value from the request.
+6. **Built-in agents**: Atlas and Scout run as background runs inside the gateway process, started from the Wallet (`POST /v1/runs`; judge mode: `POST /v1/demo/hero-run`), and call the gateway only through the public agent HTTP API (`GATEWAY_INTERNAL_URL`, loopback) with their own agent key, minted fresh per run and stored hashed: the same trust boundary as any external agent (§8.3). Runs and their timeline are persisted (`agent_runs`, `agent_run_events`) and streamed over SSE.
+7. **No AI keys / no `MODEL_*`**: the gateway boots, and every role degrades fail-closed (§8.8).
+8. **PayPal unconfigured**: the gateway boots and webhooks answer 503. A checkout that passes policy reserves its budget, then fails at AUTHORIZE with `paypal_unconfigured` (`paypal_not_connected` when the user has no vaulted wallet): the purchase goes `RESERVED → FAILED`, the reservation is released, and `PURCHASE_FAILED` + `BUDGET_RELEASED` are appended to the ledger. No fake PayPal outside unit tests and `evals/` (rule 41).
+9. **Scope is P0 only** (rule 3). Out of scope until G2: writ-mcp (P1-1), shipment tracking (P1-4), the writ-verify CLI (P1-5), reconciliation (P1-6), gateway attestation (P1-7), Agent Toolkit tools (P1-3), Kernel (P2-1), WebMCP (P2-2).
 
 ---
 
@@ -489,6 +542,7 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
 - Capture with the **exact verified amount**, `final_capture: true`, `invoice_id = "wv-…"`. Never capture more than verified even where PayPal would allow it.
 - Keep human-review windows ≤ 24 h (well inside the authorization honor period) → no re-authorization logic.
 - Log every `PayPal-Debug-Id` into the ledger (needed for Discord support and as evidence).
+- Without PayPal credentials the gateway still boots: webhooks answer 503 and a checkout that passes policy fails at AUTHORIZE with the typed reason `paypal_unconfigured`, its reservation released (§6.9 decision 8). There is no fake PayPal outside unit tests and `evals/` sink mode.
 
 ---
 
@@ -519,6 +573,7 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
 - **Atlas (naive):** one LLM, raw page text in context, tools `search_products`, `read_page`, `propose_cart`, `checkout`. Deliberately vulnerable: it represents arbitrary third-party agents. Label it "untrusted demo agent" everywhere.
 - **Scout (hardened):** Planner (sees typed facts + datamarked titles only) + Reader (quarantined: raw page → `ProductFacts`; strict schema; no URLs/emails in strings). The Planner never gets raw pages.
 - Both read their Writ via `writ_get` and receive typed rejection reasons so they can re-plan.
+- Both run as background runs inside the gateway process, started from the Wallet, but hold only their own agent key and reach the gateway only through the public agent HTTP API (`@writ/agents` `AgentApiClient`), exactly like an external agent (§6.9 decision 6). The page reader they use refuses non-http(s) URLs and private, loopback and link-local targets (except the local fixture origin) and caps size and time.
 - WritBench shows Scout is hijacked less than Atlas but **not zero** — which is exactly why money control lives outside the agent.
 
 ### 8.4 Sentinel
@@ -546,6 +601,20 @@ Headers: PayPal-Request-Id: <purchase_id>:authorize, Prefer: return=representati
 - Every output is Zod-parsed; one repair retry; then fail closed (REVIEW/BLOCK).
 - Log prompt/output (PII redacted), model id, latency, tokens → feeds `docs/EVALS.md`.
 - **No LLM has a tool that moves money.** The only money-moving code is `packages/paypal`, called by the saga.
+
+### 8.8 Without model keys (decided Nov 1, §6.9 decision 7)
+A role whose `MODEL_<ROLE>` list (or provider key) is missing is unavailable, and the gateway still boots; `GET /v1/meta` says which roles are configured so the UI degrades visibly. Every caller fails closed:
+
+| Role | Without its model |
+|---|---|
+| Intent Compiler | `POST /v1/writs/compile` → 503 `ai_unavailable`; the Wallet falls back to a manual permission-card editor (same `WritDraft`, same signing) |
+| Sentinel | the deterministic rules still run (spans, `attacks` rows), but its combiner signal is `{status: "error"}` → REVIEW |
+| Verifier | signal `{status: "error"}` → REVIEW |
+| Scout Reader / agent models | the built-in run is created and fails at once with the typed reason `ai_unavailable` (never a fake run) |
+| Dispute Analyst | `ESCALATE_TO_HUMAN` (`needs_human`); nothing is auto-executed |
+| Console analyst | the AG Studio chat harness proxy (`/api/ai/studio`) answers 503 `ai_unavailable`; dashboards and custom widgets still render |
+
+Over the global daily LLM budget (`DEMO_LLM_CALLS_PER_DAY`) a role answers `budget_exceeded` and the same rules apply. A role that throws is treated exactly like a failure.
 
 ---
 
@@ -628,7 +697,9 @@ AG Grid's brief for this prize: polish via **custom widgets, theming and layout*
 |---|---|---|
 | Language | TypeScript (strict) everywhere | Agent Toolkit, MCP SDK, AG Studio and the boilerplate are TS |
 | Web | Next.js (App Router) + Tailwind + shadcn/ui re-themed + Framer Motion | fast to polish |
-| Gateway | Fastify + Zod + Drizzle + Postgres + pg-boss | explicit backend; durable jobs without Redis |
+| Gateway | Fastify + Zod + Drizzle + Postgres; durable jobs = the `outbox` table + an in-process poller (`FOR UPDATE SKIP LOCKED`), not pg-boss (decided Nov 1, §6.9) | explicit backend; durable jobs without Redis or another queue; the same code runs on PGlite |
+| Local database | PGlite (`@electric-sql/pglite`, Postgres in WASM): `DATABASE_URL=pglite:<dir>` file-backed, `pglite:memory` in tests and evals; production requires `postgres://` | `pnpm dev` and every test run without external services (§6.9 decision 4) |
+| Sessions | stateless HMAC-signed cookie via `@fastify/cookie` (§6.9 decision 5); per-route limits via `@fastify/rate-limit` | no session store; first-party on the Wallet host through the `/gw` rewrite |
 | PayPal | thin typed fetch client in `packages/paypal` for every endpoint used (OAuth, Orders v2, Payments v2, Vault v3, Webhooks, Disputes); the server SDK is not installed | full control of `PayPal-Request-Id`, debug ids and multipart |
 | AI | Vercel AI SDK (`ai`) + provider packages; `@paypal/agent-toolkit/ai-sdk` | the toolkit plugs into the AI SDK |
 | Passkeys | `@simplewebauthn/server` + `@simplewebauthn/browser` | |
@@ -638,22 +709,25 @@ AG Grid's brief for this prize: polish via **custom widgets, theming and layout*
 | Tests | Vitest + fast-check (+ Playwright smoke in P1) | |
 | Deploy | Render Blueprint `render.yaml`: `writ-web` + `writ-gateway` (`0.5c-512mb`, formerly Starter; Node 22 pinned) + Postgres `0.1c-256mb` (smallest paid) | no spin-down, no 30-day DB expiry |
 
+Every dependency installed for the P0 build (one pass, Nov 1) is listed with its reason in `docs/ARCHITECTURE.md` §11 (rule 40). Not installed: pg-boss (replaced by the outbox poller), the MCP SDK and the Agent Toolkit (P1), Kernel (P2).
+
 ```text
 writ/
 ├─ apps/
-│  ├─ web/                 # Next.js: Wallet, Console (AG Studio), /fixtures/deals-outlet pages
-│  └─ gateway/             # Fastify: API, webhooks, MCP HTTP, jobs
+│  ├─ web/                 # Next.js: Wallet, Console (AG Studio), /fixtures/deals-outlet pages; /gw/* → gateway
+│  └─ gateway/             # Fastify: API + SSE, pipeline, saga, outbox jobs, webhooks, disputes, built-in agent runs (MCP HTTP in P1)
 ├─ packages/
-│  ├─ core/                # Writ schema (Zod), taxonomy, JCS hashing, signatures, policy engine (pure)
+│  ├─ core/                # Writ schema (Zod), taxonomy, JCS hashing, signatures, policy engine (pure); @writ/core/api = HTTP contract
 │  ├─ paypal/              # typed client: orders, payments, vault, disputes, webhooks, tracking
-│  ├─ ai/                  # model router, prompts, compiler, reader, sentinel, verifier, analyst, agents
+│  ├─ ai/                  # model router, prompts, compiler, reader, sentinel, verifier, analyst
+│  ├─ agents/              # Atlas + Scout reference agents, typed agent-API client, page reader (added Nov 1)
 │  ├─ ledger/              # hash chain + evidence pack (JSON/PDF)
-│  ├─ mcp/                 # writ-mcp (stdio + HTTP)
-│  └─ verify-cli/          # npx writ-verify evidence.json
-├─ evals/                  # WritBench cases, runners, results/
+│  ├─ mcp/                 # writ-mcp (stdio + HTTP), P1-1
+│  └─ verify-cli/          # npx writ-verify evidence.json, P1-5
+├─ evals/                  # WritBench cases, runners, results/ (workspace package @writ/evals)
 ├─ fixtures/deals-outlet/  # poisoned test pages, labeled "security test fixture"
-├─ docs/                   # ARCHITECTURE, SECURITY, EVALS, JUDGES, WRIT-SPEC, diagrams
-├─ scripts/                # spikes (S1–S8), seed, smoke test
+├─ docs/                   # ARCHITECTURE (build streams + contracts), SECURITY, EVALS, JUDGES, WRIT-SPEC, diagrams
+├─ scripts/                # spikes (S1–S8), `pnpm dev` launcher, seed, smoke test
 ├─ render.yaml
 ├─ CLAUDE.md / AGENTS.md   # = §22 verbatim
 ├─ LICENSE                 # MIT
@@ -669,14 +743,16 @@ PAYPAL_CLIENT_SECRET=
 PAYPAL_WEBHOOK_ID=
 PAYPAL_SANDBOX_BUYER_EMAIL=        # dispute simulation (PayPal-Auth-Assertion)
 # App
-APP_BASE_URL=
-GATEWAY_BASE_URL=
-DATABASE_URL=
-WEBAUTHN_RP_ID=                    # exact Wallet host, e.g. writ-web.onrender.com (onrender.com is a public suffix)
+APP_ENV=                           # production | development | test (default: development; production on Render)
+APP_BASE_URL=                      # Wallet origin (default http://localhost:3000); WebAuthn origin
+GATEWAY_BASE_URL=                  # gateway origin (default http://localhost:10000); the Wallet rewrites /gw/* here
+GATEWAY_INTERNAL_URL=              # built-in agents call the agent API here (default http://127.0.0.1:$PORT)
+DATABASE_URL=                      # postgres://... in production; pglite:.data/gateway or pglite:memory locally (default pglite:.data/gateway)
+WEBAUTHN_RP_ID=                    # exact Wallet host, e.g. writ-web.onrender.com (onrender.com is a public suffix); default: APP_BASE_URL host
 WEBAUTHN_RP_NAME=Writ
-SESSION_SECRET=
+SESSION_SECRET=                    # >= 32 chars; required in production; development generates an ephemeral one
 GATEWAY_ATTESTATION_KEY=           # Ed25519, P1-7
-# AI (IDs decided in S5; never hard-code)
+# AI (IDs decided in S5; never hard-code). Unset = the role is unavailable and callers fail closed.
 MODEL_COMPILER=
 MODEL_AGENT=
 MODEL_READER=
@@ -695,10 +771,14 @@ NEXT_PUBLIC_AG_STUDIO_LICENSE_KEY=
 # Judge mode
 JUDGE_MODE=true
 DEMO_HERO_RUNS_PER_HOUR=5
+DEMO_LLM_CALLS_PER_DAY=1000        # global daily LLM request budget
+DEMO_PAYPAL_VAULT_ID=              # a real sandbox Vault payment token id (Spike S1) seeded for judge tenants
 # Gateway runtime and Day-1 spikes
 PORT=10000
 HOST=0.0.0.0
 LOG_LEVEL=info
+JOBS_ENABLED=true                  # outbox job poller (tests drive jobs directly)
+JOB_POLL_INTERVAL_MS=1000
 ENABLE_SPIKES=false
 SPIKE_PORT=8787
 SPIKE_PASSKEY_PORT=8788
@@ -762,6 +842,7 @@ Assumes ~6 focused hours on weekdays and ~12 on weekends. If you have less, appl
 - **B — AI & evals** (router, compiler, agents, sentinel, verifier, analyst, WritBench).
 - **C — Product & story** (Wallet, AG Studio console, design system, video, Devpost copy).
 - Contracts between lanes are the Zod schemas in `packages/core` — frozen by Nov 2, 20:00; changes need all lanes' OK.
+- Nov 1: P0 is built by parallel build streams in one working tree (money, api, ai, agents, evidence, web-foundation, web-wallet, web-flows, console, judge, bench). Their file ownership, the frozen files and every cross-stream contract (`@writ/core`, `@writ/core/api`, the gateway's `src/contracts`, `src/deps.ts`, `src/tx`, `packages/ai/src/roles/types.ts`, `packages/agents/src/types.ts`) are in `docs/ARCHITECTURE.md` §2–§3; a stream that needs a change in a frozen file reports it instead of editing.
 
 **Solo:** A + B fully; C = Wallet hero path + Dashboard 1 only; MCP only if G2 is green by Nov 6.
 
@@ -789,8 +870,8 @@ Every spike writes its result (PASS / FALLBACK + why + IDs) into `docs/SPIKES.md
 ## 18. Judge experience and uptime until Dec 15
 
 - **Landing page:** one-sentence pitch · "Try it as a judge (no sign-up)" · "Watch the 2:45 demo".
-- **Judge mode:** an isolated tenant per visitor (cookie); seeded Ana with a pre-vaulted sandbox PayPal token; a pre-signed Writ (signed by a clearly labeled demo device key); **"Run the hero scenario"** executes scenes 4–8 live on sandbox in ~60–90 s with the timeline; pre-created disputes with full history; optional "create your own Writ" with your own passkey; the sandbox buyer login is shown for the PayPal connect step.
-- **Limits:** 5 hero runs per tenant per hour; a global daily LLM budget; provider fallback; if every provider fails, show a visible "cached result" badge — never silently.
+- **Judge mode:** an isolated tenant per visitor (cookie); seeded Ana with a pre-vaulted sandbox PayPal token (`DEMO_PAYPAL_VAULT_ID`, a real token from Spike S1); a pre-signed Writ (signed by a clearly labeled demo device key); **"Run the hero scenario"** (`POST /v1/demo/hero-run`) executes scenes 4–8 live on sandbox in ~60–90 s with the timeline, through the built-in Atlas run (§6.9 decision 6); pre-created disputes with full history; optional "create your own Writ" with your own passkey; the sandbox buyer login is shown for the PayPal connect step.
+- **Limits:** 5 hero runs per tenant per hour (`DEMO_HERO_RUNS_PER_HOUR`); a global daily LLM budget (`DEMO_LLM_CALLS_PER_DAY`), both counted in `rate_counters` so they survive restarts; provider fallback; if every provider fails, show a visible "cached result" badge — never silently.
 - **README top section "Judges: 5-minute path"** + `docs/JUDGES.md` with screenshots.
 - **Uptime:** paid Render instances; health checks; UptimeRobot email alerts; quota check-ins on Nov 20, Nov 30, Dec 7 and Dec 13 (Channel3 credits, LLM quotas, AG license, sandbox buyer balance, PayPal token refresh).
 - **After submitting:** `main` frozen at `v1.0-submission`; only availability fixes, each logged in `POST-SUBMISSION.md`; new work on a `next` branch.

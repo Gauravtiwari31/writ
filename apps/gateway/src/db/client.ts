@@ -1,10 +1,11 @@
+import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { PGlite } from "@electric-sql/pglite";
 import { is, type SQL } from "drizzle-orm";
 import { drizzle as drizzleNodePg, NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate as migrateNodePg } from "drizzle-orm/node-postgres/migrator";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
-// Type-only: drizzle-orm/pglite imports PGlite at runtime, and PGlite is a devDependency.
+// Type-only: drizzle-orm/pglite and PGlite are loaded lazily, so a Postgres deployment never boots the WASM build.
 import type { PgliteDatabase } from "drizzle-orm/pglite";
 import type { Pool, PoolConfig } from "pg";
 import * as schema from "./schema";
@@ -27,15 +28,40 @@ export function createPgDb(databaseUrl: string, pool: Omit<PoolConfig, "connecti
   return drizzleNodePg({ connection: { ...pool, connectionString: databaseUrl }, schema });
 }
 
-/** In-memory Postgres (WASM) for tests. Loaded lazily so production never imports a devDependency. */
-export async function createPgliteDb(): Promise<PgliteDb> {
+export interface PgliteOptions {
+  /** Directory for a file-backed database (created if missing); omitted = in-memory (tests, evals). */
+  dataDir?: string;
+}
+
+/**
+ * PGlite: Postgres compiled to WASM, in-process. In-memory for tests and evals; file-backed for local
+ * runs (DATABASE_URL=pglite:<dir>, plan decision 4). Loaded lazily so a Postgres deployment never
+ * boots the WASM build.
+ */
+export async function createPgliteDb(options: PgliteOptions = {}): Promise<PgliteDb> {
   const [{ PGlite }, { drizzle }] = await Promise.all([
     import("@electric-sql/pglite"),
     import("drizzle-orm/pglite"),
   ]);
-  const client = new PGlite();
+  if (options.dataDir !== undefined) mkdirSync(options.dataDir, { recursive: true });
+  const client = options.dataDir === undefined ? new PGlite() : new PGlite(options.dataDir);
   await client.waitReady;
   return drizzle({ client, schema });
+}
+
+/** Where the gateway keeps its data (config.ts parses DATABASE_URL into this). */
+export type DatabaseSpec =
+  | { readonly kind: "postgres"; readonly url: string }
+  | { readonly kind: "pglite"; readonly dataDir: string | null };
+
+/** Opens the database a DatabaseSpec names. Run runMigrations() before serving traffic. */
+export async function openDatabase(spec: DatabaseSpec): Promise<AppDb> {
+  if (spec.kind === "postgres") return createPgDb(spec.url);
+  return spec.dataDir === null ? createPgliteDb() : createPgliteDb({ dataDir: spec.dataDir });
+}
+
+export function databaseKind(db: AppDb): "postgres" | "pglite" {
+  return isNodePg(db) ? "postgres" : "pglite";
 }
 
 function isNodePg(db: AppDb): db is PgDb {

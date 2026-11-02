@@ -15,6 +15,13 @@
       "when": 1793472512623,
       "tag": "0001_writ_status_ledger_ts",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793596795005,
+      "tag": "0002_p0_contracts",
+      "breakpoints": true
     }
   ]
 }

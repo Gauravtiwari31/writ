@@ -1,0 +1,26 @@
+{
+  "name": "@writ/evals",
+  "version": "0.0.0",
+  "private": true,
+  "description": "WritBench-lite: attack and benign cases, the runner (sink | gateway mode), metrics and the README table generator. PayPal is stubbed ONLY here, in sink mode (disclosed in docs/EVALS.md).",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "eval": "tsx src/cli.ts",
+    "report": "tsx src/report.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@writ/agents": "workspace:*",
+    "@writ/ai": "workspace:*",
+    "@writ/core": "workspace:*",
+    "@writ/gateway": "workspace:*",
+    "@writ/ledger": "workspace:*",
+    "@writ/paypal": "workspace:*",
+    "zod": "^4.6.7"
+  }
+}

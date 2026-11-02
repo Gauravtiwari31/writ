@@ -4,6 +4,7 @@ import { createHash, generateKeyPairSync, sign as signDer, type KeyObject } from
 import { fromBase64Url, hashJcs, jcs, toBase64Url } from "@writ/core";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
+import { lazySchemaController } from "../src/http/fastify";
 import {
   buildReport,
   describeClient,
@@ -166,7 +167,8 @@ function assertion(auth: SoftAuthenticator, rpID: string, challenge: string, ori
 const apps: FastifyInstance[] = [];
 
 async function makeApp(options: PasskeySpikeOptions = { rpID: "localhost", origins: [] }): Promise<FastifyInstance> {
-  const app = Fastify();
+  // The gateway's Fastify options (buildApp mounts this plugin the same way): no eager JSON-schema compilers.
+  const app = Fastify({ schemaController: lazySchemaController() });
   await app.register(passkeySpikePlugin, options);
   await app.ready();
   apps.push(app);

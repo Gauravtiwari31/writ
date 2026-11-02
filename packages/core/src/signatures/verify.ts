@@ -50,3 +50,17 @@ export async function verifyWritSignature(
     return signatureFailure("malformed", errorDetail(error));
   }
 }
+
+/**
+ * Re-verifies a signature already accepted at signing time (every checkout, receipts, evidence). The
+ * authenticator counter protects live ceremonies against replay; a stored assertion can never advance
+ * past its own counter, so here the counter check is off. Everything else is still verified.
+ */
+export function verifyStoredWritSignature(
+  body: WritBody,
+  signature: WritSignature,
+  ctx: WritSignatureContext,
+): Promise<WritSignatureVerification> {
+  const webauthn = ctx.webauthn === undefined ? undefined : { ...ctx.webauthn, skipCounterCheck: true };
+  return verifyWritSignature(body, signature, { ...ctx, ...(webauthn === undefined ? {} : { webauthn }) });
+}

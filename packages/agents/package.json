@@ -1,0 +1,23 @@
+{
+  "name": "@writ/agents",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reference agents (Atlas: naive, Scout: hardened), the typed agent-API client and the page reader. Untrusted by design: they reach the gateway only through the public agent API with their own key.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@writ/ai": "workspace:*",
+    "@writ/core": "workspace:*",
+    "ai": "^7.0.0",
+    "domhandler": "^6.0.1",
+    "htmlparser2": "^12.0.0",
+    "zod": "^4.6.7"
+  }
+}

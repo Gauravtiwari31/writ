@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import { toHex, utf8 } from "./bytes";
 import { jcs } from "./jcs";
@@ -16,3 +17,6 @@ export function hashJcs(value: unknown): Uint8Array {
 export function hashJcsHex(value: unknown): string {
   return toHex(hashJcs(value));
 }
+
+/** A SHA-256 hash in lowercase hex (64 chars): how hashes travel in JSON documents and API bodies. */
+export const HashHexSchema = z.string().regex(/^[0-9a-f]{64}$/, "expected 32 bytes as 64 lowercase hex chars");

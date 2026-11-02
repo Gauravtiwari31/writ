@@ -21,6 +21,8 @@ export interface WebAuthnOverHashInput {
   expectedOrigin: string | readonly string[];
   expectedRpId: string;
   requireUserVerification: boolean;
+  /** Only for re-verifying a stored assertion (verifyStoredWritSignature); live ceremonies keep the replay check. */
+  skipCounterCheck?: boolean;
 }
 
 /** On success, persist `newCounter` to passkeys.counter so a replayed assertion fails next time. */
@@ -103,8 +105,9 @@ async function verify(input: WebAuthnOverHashInput): Promise<WebAuthnVerificatio
   }
   const counter = new DataView(authData.buffer, authData.byteOffset + RP_ID_HASH_BYTES + 1, 4).getUint32(0, false);
   // Same rule as the library: authenticators that always report 0 (many synced passkeys) are allowed.
-  if ((counter > 0 || credential.counter > 0) && counter <= credential.counter) {
-    return signatureFailure("counter_replay", `counter ${counter} did not advance past ${credential.counter}`);
+  const storedCounter = input.skipCounterCheck === true ? 0 : credential.counter;
+  if ((counter > 0 || storedCounter > 0) && counter <= storedCounter) {
+    return signatureFailure("counter_replay", `counter ${counter} did not advance past ${storedCounter}`);
   }
 
   const response: AuthenticationResponseJSON = {
@@ -125,7 +128,7 @@ async function verify(input: WebAuthnOverHashInput): Promise<WebAuthnVerificatio
     expectedOrigin: origins,
     expectedRPID: expectedRpId,
     expectedType: "webauthn.get",
-    credential: { id: credential.id, publicKey: Uint8Array.from(credential.publicKeyCose), counter: credential.counter },
+    credential: { id: credential.id, publicKey: Uint8Array.from(credential.publicKeyCose), counter: storedCounter },
     requireUserVerification,
   });
   if (!result.verified) {

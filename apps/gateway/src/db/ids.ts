@@ -23,6 +23,12 @@ const LOCAL_ROW_PREFIXES = {
   dispute: "dsp",
   attack: "atk",
   outbox: "obx",
+  /** tenant_id values minted for new wallets and judge visitors (no table: tenant_id is a column everywhere). */
+  tenant: "tn",
+  challenge: "chl",
+  run: "run",
+  evidenceLink: "evl",
+  catalogItem: "cat",
 } as const;
 
 export const ROW_ID_PREFIXES = { ...CORE_ROW_PREFIXES, ...LOCAL_ROW_PREFIXES } as const;

@@ -218,6 +218,14 @@ describe("verifyWebAuthnOverHash", () => {
     expect(result).toEqual({ ok: true, newCounter: 1, userVerified: false });
   });
 
+  it("re-verifies a stored assertion without the counter check, but never a bad signature", async () => {
+    const stored = { ...passkey, credential: { ...passkey.credential, counter: 5 } };
+    const assertion = assertWith(stored, { counter: 5 });
+    expect(await verifyWebAuthnOverHash({ ...input(stored, assertion), skipCounterCheck: true })).toMatchObject({ ok: true });
+    const forged = { ...assertion, signature: assertWith(stored, { counter: 5, hash: new Uint8Array(32) }).signature };
+    expect(await verifyWebAuthnOverHash({ ...input(stored, forged), skipCounterCheck: true })).toMatchObject({ ok: false });
+  });
+
   it("rejects a counter that does not advance and allows always-zero authenticators", async () => {
     const stored = { ...passkey, credential: { ...passkey.credential, counter: 5 } };
     expect(await verifyWebAuthnOverHash(input(stored, assertWith(stored, { counter: 5 })))).toMatchObject({

@@ -4,9 +4,10 @@
 # database EXPIRES 30 DAYS AFTER CREATION (then is deleted after a 14-day grace period), which is
 # before judging ends on Dec 15. Free Postgres is forbidden here (§22 rule 33): never set plan: free.
 #
-# Secrets use sync: false, so Render asks for them when the Blueprint is first applied and they never
-# live in git (§22 rule 20). Sandbox only: PAYPAL_ENV is pinned to "sandbox" and the gateway refuses
-# to start with anything else (§22 rule 21).
+# Secrets use sync: false (Render asks for them, or they are set in the dashboard) or generateValue,
+# so they never live in git (§22 rule 20). An unset optional integration degrades visibly instead of
+# failing (GET /v1/meta). Sandbox only: PAYPAL_ENV is pinned to "sandbox" and the gateway refuses to
+# start with anything else (§22 rule 21).
 
 services:
   - type: web
@@ -18,7 +19,8 @@ services:
     branch: main
     # Node 25+ no longer bundles Corepack, so install it explicitly, then let packageManager in
     # package.json pick the pnpm version. Dev dependencies are needed at runtime (tsx runs the
-    # TypeScript sources), so NODE_ENV must not be "production" during the build.
+    # TypeScript sources), so NODE_ENV must not be "production" during the build; APP_ENV says
+    # production instead.
     buildCommand: npm install -g corepack && corepack enable && pnpm install --frozen-lockfile
     startCommand: pnpm --filter @writ/gateway start
     healthCheckPath: /healthz
@@ -27,6 +29,15 @@ services:
       # Render's default for new services is Node 24; the repo targets Node 22 (engines >=22.12).
       - key: NODE_VERSION
         value: "22"
+      # Production rules: SESSION_SECRET and a postgres DATABASE_URL are required.
+      - key: APP_ENV
+        value: production
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: writ-db
+          property: connectionString
       - key: PAYPAL_ENV
         value: sandbox
       - key: PAYPAL_CLIENT_ID
@@ -36,20 +47,77 @@ services:
       # Printed by: pnpm spike spike-webhooks.ts register --url https://<service>.onrender.com/v1/webhooks/paypal
       - key: PAYPAL_WEBHOOK_ID
         sync: false
-      # The onrender.com host of this service (no scheme), for the S6 passkey spike.
+      - key: PAYPAL_SANDBOX_BUYER_EMAIL
+        sync: false
+      # The Wallet origin (https://<writ-web host>): WebAuthn expectedOrigin. Unset = passkey routes answer 503.
+      - key: APP_BASE_URL
+        sync: false
+      # The exact Wallet host (no scheme). During the S6 spike it named this gateway's host; after G0
+      # it must be the Wallet host (plan decision 2), otherwise product passkey routes stay disabled.
       - key: WEBAUTHN_RP_ID
         sync: false
       - key: WEBAUTHN_RP_NAME
         value: Writ
+      - key: JUDGE_MODE
+        value: "true"
+      - key: DEMO_HERO_RUNS_PER_HOUR
+        value: "5"
+      - key: DEMO_LLM_CALLS_PER_DAY
+        value: "1000"
+      # A real sandbox Vault payment token id from Spike S1, seeded for judge tenants.
+      - key: DEMO_PAYPAL_VAULT_ID
+        sync: false
+      - key: CHANNEL3_API_KEY
+        sync: false
+      # Model lists per role ("provider:model-id,..."; ids from the S5 run, never hard-coded) and provider keys.
+      - key: MODEL_COMPILER
+        sync: false
+      - key: MODEL_AGENT
+        sync: false
+      - key: MODEL_READER
+        sync: false
+      - key: MODEL_SENTINEL
+        sync: false
+      - key: MODEL_VERIFIER
+        sync: false
+      - key: MODEL_ANALYST
+        sync: false
+      - key: MODEL_CONSOLE
+        sync: false
+      - key: GOOGLE_GENERATIVE_AI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
       # Day-1 spikes (S3 status, S6 passkey) need the Render domain. Set to "false" once G0 is closed.
       - key: ENABLE_SPIKES
         value: "true"
       - key: LOG_LEVEL
         value: info
-      - key: DATABASE_URL
-        fromDatabase:
-          name: writ-db
-          property: connectionString
+
+  - type: web
+    name: writ-web
+    runtime: node
+    plan: 0.5c-512mb
+    region: oregon
+    branch: main
+    buildCommand: npm install -g corepack && corepack enable && pnpm install --frozen-lockfile && pnpm --filter @writ/web build
+    # `next start` listens on Render's PORT.
+    startCommand: pnpm --filter @writ/web start
+    healthCheckPath: /
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      # The gateway's public origin (https://<writ-gateway host>) for the /gw rewrite. Read at build
+      # time, so change it and redeploy together.
+      - key: GATEWAY_BASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_AG_STUDIO_LICENSE_KEY
+        sync: false
 
 databases:
   - name: writ-db

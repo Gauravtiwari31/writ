@@ -1,0 +1,33 @@
+/*
+ * Writ design tokens (plan §10: "a notary's desk, digitized"). Owner: web-foundation stream, which
+ * builds the full design system on these: one serif, one sans, one mono, one accent, 8-pt spacing,
+ * dark mode, reduced motion. Only the starting tokens live here.
+ */
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0f1115;
+  --color-parchment: #f6f3ec;
+  --color-seal: #e2492f;
+  --font-serif: "Fraunces Variable", ui-serif, Georgia, serif;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --spacing: 0.25rem;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  background: var(--color-parchment);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: var(--color-ink);
+    color: var(--color-parchment);
+  }
+}

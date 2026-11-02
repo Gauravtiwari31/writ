@@ -2,7 +2,7 @@ import { sha256 } from "@writ/core";
 import { eq, sql } from "drizzle-orm";
 import fc from "fast-check";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getBudget, releaseReservation, reserveBudget, settleReservation } from "../src/budget/reservations";
+import { getBudget, policyBudgetOf, releaseReservation, reserveBudget, reverseSettlement, settleReservation } from "../src/budget/reservations";
 import {
   type AppDb,
   closeDb,
@@ -49,16 +49,18 @@ function expectInvariants(row: WritBudget): void {
   expect(row.reservedMinor).toBeGreaterThanOrEqual(0n);
   expect(row.spentMinor).toBeGreaterThanOrEqual(0n);
   expect(row.spentMinor + row.reservedMinor).toBeLessThanOrEqual(row.limitMinor);
-  expect(row.ordersCount).toBeLessThanOrEqual(row.maxOrders);
+  expect(row.heldOrders).toBeGreaterThanOrEqual(0);
+  expect(row.ordersCount + row.heldOrders).toBeLessThanOrEqual(row.maxOrders);
 }
 
-// Reference model of the three guarded statements.
+// Reference model of the three guarded statements (held_orders semantics, plan §6.8).
 interface Model {
   limit: bigint;
   maxOrders: number;
   reserved: bigint;
   spent: bigint;
   orders: number;
+  held: number;
   version: number;
 }
 
@@ -67,18 +69,21 @@ type OpKind = "reserve" | "settle" | "release";
 function applyModel(m: Model, kind: OpKind, amount: bigint): boolean {
   switch (kind) {
     case "reserve":
-      if (m.spent + m.reserved + amount > m.limit || m.orders >= m.maxOrders) return false;
+      if (m.spent + m.reserved + amount > m.limit || m.orders + m.held >= m.maxOrders) return false;
       m.reserved += amount;
+      m.held += 1;
       break;
     case "settle":
-      if (m.reserved < amount || m.orders >= m.maxOrders) return false;
+      if (m.reserved < amount || m.held < 1) return false;
       m.reserved -= amount;
       m.spent += amount;
       m.orders += 1;
+      m.held -= 1;
       break;
     case "release":
-      if (m.reserved < amount) return false;
+      if (m.reserved < amount || m.held < 1) return false;
       m.reserved -= amount;
+      m.held -= 1;
       break;
   }
   m.version += 1;
@@ -183,34 +188,73 @@ for (const driver of drivers) {
       expect(await reserveBudget(db, { writId, amountMinor: 2n ** 63n - 1n })).toBeNull();
     });
 
-    it("enforces max_orders on reserve and on settle", async () => {
+    it("counts held orders against max_orders: a held slot blocks the next reservation", async () => {
       const writId = await seedWrit(db, HUNDRED_DOLLARS, 1);
-      // Two holds can be outstanding at once (the §6.8 statement only checks settled orders) ...
-      expect(await reserveBudget(db, { writId, amountMinor: 1_000n })).not.toBeNull();
-      expect(await reserveBudget(db, { writId, amountMinor: 2_000n })).not.toBeNull();
-      expect(await settleReservation(db, { writId, amountMinor: 1_000n })).toMatchObject({ ordersCount: 1 });
-      // ... but only max_orders of them can ever be captured; the other must be voided.
-      expect(await settleReservation(db, { writId, amountMinor: 2_000n })).toBeNull();
+      expect(await reserveBudget(db, { writId, amountMinor: 1_000n })).toMatchObject({ heldOrders: 1, ordersCount: 0 });
+      // held_orders adopted (plan §6.8): the only slot is held, so a second checkout is a BLOCK before PayPal.
+      expect(await reserveBudget(db, { writId, amountMinor: 2_000n })).toBeNull();
+      expect(await settleReservation(db, { writId, amountMinor: 1_000n })).toMatchObject({ ordersCount: 1, heldOrders: 0 });
       expect(await reserveBudget(db, { writId, amountMinor: 1n })).toBeNull();
-      expect(await releaseReservation(db, { writId, amountMinor: 2_000n })).toMatchObject({
-        reservedMinor: 0n,
-        spentMinor: 1_000n,
-        ordersCount: 1,
-      });
+      // Nothing is held any more, so nothing can be settled or released.
+      expect(await settleReservation(db, { writId, amountMinor: 1n })).toBeNull();
+      expect(await releaseReservation(db, { writId, amountMinor: 1n })).toBeNull();
+      expect(await mustGet(db, writId)).toMatchObject({ reservedMinor: 0n, spentMinor: 1_000n, ordersCount: 1, heldOrders: 0 });
+    });
+
+    it("frees the order slot when a hold is released (void or failure)", async () => {
+      const writId = await seedWrit(db, HUNDRED_DOLLARS, 1);
+      expect(await reserveBudget(db, { writId, amountMinor: 4_400n })).toMatchObject({ heldOrders: 1 });
+      expect(await releaseReservation(db, { writId, amountMinor: 4_400n })).toMatchObject({ reservedMinor: 0n, heldOrders: 0 });
+      expect(await reserveBudget(db, { writId, amountMinor: 3_600n })).toMatchObject({ reservedMinor: 3_600n, heldOrders: 1 });
+    });
+
+    it("max_orders = 1: concurrent checkouts yield exactly one reservation", async () => {
+      await fc.assert(
+        fc.asyncProperty(fc.integer({ min: 2, max: 12 }), fc.bigInt({ min: 1n, max: 2_000n }), async (attempts, amountMinor) => {
+          const writId = await seedWrit(db, HUNDRED_DOLLARS, 1);
+          const results = await Promise.all(Array.from({ length: attempts }, () => reserveBudget(db, { writId, amountMinor })));
+          expect(results.filter((row) => row !== null)).toHaveLength(1);
+          const final = await mustGet(db, writId);
+          expectInvariants(final);
+          expect(final).toMatchObject({ reservedMinor: amountMinor, heldOrders: 1, ordersCount: 0, version: 1 });
+        }),
+        { numRuns: driver.runs.race },
+      );
+    }, 120_000);
+
+    it("reverses a settlement only for money that never moved (capture refused)", async () => {
+      const writId = await seedWrit(db, HUNDRED_DOLLARS, 1);
+      await reserveBudget(db, { writId, amountMinor: 4_400n });
+      await settleReservation(db, { writId, amountMinor: 4_400n });
+      expect(await reverseSettlement(db, { writId, amountMinor: 4_401n })).toBeNull();
+      expect(await reverseSettlement(db, { writId, amountMinor: 4_400n })).toMatchObject({ spentMinor: 0n, ordersCount: 0, heldOrders: 0 });
+      expect(await reverseSettlement(db, { writId, amountMinor: 1n })).toBeNull();
+      expect(await reserveBudget(db, { writId, amountMinor: 10_000n })).toMatchObject({ heldOrders: 1 });
+      await expect(reverseSettlement(db, { writId, amountMinor: 0n })).rejects.toThrow(RangeError);
+    });
+
+    it("gives the policy engine settled + held orders", async () => {
+      const writId = await seedWrit(db, HUNDRED_DOLLARS, 3);
+      await reserveBudget(db, { writId, amountMinor: 100n });
+      await reserveBudget(db, { writId, amountMinor: 200n });
+      await settleReservation(db, { writId, amountMinor: 100n });
+      expect(policyBudgetOf(await mustGet(db, writId))).toEqual({ spent_minor: 100n, reserved_minor: 200n, orders_count: 2 });
     });
 
     it("guards settle and release against more than is reserved", async () => {
       const writId = await seedWrit(db, HUNDRED_DOLLARS, 3);
-      await reserveBudget(db, { writId, amountMinor: 500n });
+      await reserveBudget(db, { writId, amountMinor: 200n });
+      await reserveBudget(db, { writId, amountMinor: 300n });
       expect(await settleReservation(db, { writId, amountMinor: 501n })).toBeNull();
       expect(await releaseReservation(db, { writId, amountMinor: 501n })).toBeNull();
-      expect(await releaseReservation(db, { writId, amountMinor: 200n })).toMatchObject({ reservedMinor: 300n });
+      expect(await releaseReservation(db, { writId, amountMinor: 200n })).toMatchObject({ reservedMinor: 300n, heldOrders: 1 });
       expect(await settleReservation(db, { writId, amountMinor: 300n })).toMatchObject({
         reservedMinor: 0n,
         spentMinor: 300n,
+        heldOrders: 0,
       });
       expect(await releaseReservation(db, { writId, amountMinor: 1n })).toBeNull();
-      expect(await mustGet(db, writId)).toMatchObject({ reservedMinor: 0n, spentMinor: 300n, ordersCount: 1, version: 3 });
+      expect(await mustGet(db, writId)).toMatchObject({ reservedMinor: 0n, spentMinor: 300n, ordersCount: 1, heldOrders: 0, version: 4 });
     });
 
     it("joins the caller's transaction and rolls back with it", async () => {
@@ -241,19 +285,21 @@ for (const driver of drivers) {
         ["writ_budgets_reserved_check", db.update(writBudgets).set({ reservedMinor: -1n }).where(where)],
         ["writ_budgets_spent_check", db.update(writBudgets).set({ spentMinor: -1n }).where(where)],
         ["writ_budgets_orders_count_check", db.update(writBudgets).set({ ordersCount: 3 }).where(where)],
+        ["writ_budgets_held_orders_check", db.update(writBudgets).set({ heldOrders: -1 }).where(where)],
+        ["writ_budgets_orders_within_max_check", db.update(writBudgets).set({ heldOrders: 3 }).where(where)],
         ["writ_budgets_limit_check", db.update(writBudgets).set({ limitMinor: 0n, reservedMinor: 0n }).where(where)],
       ];
       for (const [constraint, attempt] of attempts) {
         await expect(attempt, constraint).rejects.toSatisfy((e: unknown) => isCheckViolation(e, constraint));
       }
-      expect(await mustGet(db, writId)).toMatchObject({ reservedMinor: 9_000n, spentMinor: 0n, ordersCount: 0 });
+      expect(await mustGet(db, writId)).toMatchObject({ reservedMinor: 9_000n, spentMinor: 0n, ordersCount: 0, heldOrders: 1 });
     });
 
     it("property: any reserve/settle/release sequence keeps the invariants and matches the model", async () => {
       await fc.assert(
         fc.asyncProperty(fc.integer({ min: 1, max: 6 }), fc.array(opArb, { minLength: 1, maxLength: 40 }), async (maxOrders, ops) => {
           const writId = await seedWrit(db, HUNDRED_DOLLARS, maxOrders);
-          const model: Model = { limit: HUNDRED_DOLLARS, maxOrders, reserved: 0n, spent: 0n, orders: 0, version: 0 };
+          const model: Model = { limit: HUNDRED_DOLLARS, maxOrders, reserved: 0n, spent: 0n, orders: 0, held: 0, version: 0 };
           const holds: bigint[] = [];
 
           for (const op of ops) {
@@ -284,6 +330,7 @@ for (const driver of drivers) {
               reservedMinor: model.reserved,
               spentMinor: model.spent,
               ordersCount: model.orders,
+              heldOrders: model.held,
               version: model.version,
             });
           }
@@ -314,6 +361,7 @@ for (const driver of drivers) {
             expectInvariants(final);
             expect(granted).toBeLessThanOrEqual(HUNDRED_DOLLARS);
             expect(final.reservedMinor).toBe(granted);
+            expect(final.heldOrders).toBe(wins.length);
             expect(final.version).toBe(wins.length);
 
             // Linearizable: ordered by version, each winner saw exactly the reservations before it.

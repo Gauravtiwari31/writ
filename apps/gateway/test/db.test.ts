@@ -1,6 +1,12 @@
 import {
+  APPROVAL_DECISIONS as CORE_APPROVAL_DECISIONS,
+  APPROVAL_STATUSES as CORE_APPROVAL_STATUSES,
+  CATALOG_SOURCES as CORE_CATALOG_SOURCES,
   CurrencySchema,
+  DECISION_RECORD_STAGES as CORE_DECISION_RECORD_STAGES,
   fromHex,
+  PURCHASE_STATE_REASONS as CORE_PURCHASE_STATE_REASONS,
+  PURCHASE_STATES as CORE_PURCHASE_STATES,
   idSchema,
   idTimestamp,
   sha256,
@@ -9,13 +15,32 @@ import {
   WRIT_STATUSES as CORE_WRIT_STATUSES,
   writShort,
 } from "@writ/core";
+import {
+  AGENT_KINDS as CORE_AGENT_KINDS,
+  BUILTIN_AGENT_KINDS as CORE_BUILTIN_AGENT_KINDS,
+  RUN_MODES as CORE_RUN_MODES,
+  RUN_STATUSES as CORE_RUN_STATUSES,
+  VAULT_TOKEN_STATUSES as CORE_VAULT_TOKEN_STATUSES,
+} from "@writ/core/api";
 import { appendEvent, type LedgerEvent, verifyChain } from "@writ/ledger";
 import { asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  AGENT_KINDS,
   type AppDb,
   agents,
+  APPROVAL_DECISIONS,
+  APPROVAL_STATUSES,
+  approvals,
+  BUILTIN_AGENT_KINDS,
+  CATALOG_SOURCES,
   carts,
+  DECISION_RECORD_STAGES,
+  decisions,
+  paypalVaultTokens,
+  RUN_MODES,
+  RUN_STATUSES,
+  VAULT_TOKEN_STATUSES,
   closeDb,
   createPgDb,
   createPgliteDb,
@@ -30,6 +55,7 @@ import {
   newRowId,
   ROW_ID_PREFIXES,
   passkeys,
+  PURCHASE_STATE_REASONS,
   PURCHASE_STATES,
   purchases,
   runMigrations,
@@ -40,7 +66,7 @@ import {
   writs,
 } from "../src/db/index";
 
-// Every table in plan §6.5.
+// Every table in plan §6.5 (the last six arrived with migration 0002 for the parallel build).
 const PLAN_TABLES = [
   "address_book",
   "agents",
@@ -59,6 +85,12 @@ const PLAN_TABLES = [
   "webhook_events",
   "writ_budgets",
   "writs",
+  "agent_run_events",
+  "agent_runs",
+  "auth_challenges",
+  "catalog_items",
+  "evidence_links",
+  "rate_counters",
 ];
 
 const TENANT = "tn_dbtest";
@@ -84,6 +116,7 @@ async function seed(db: Db): Promise<Fixture> {
     userId,
     name: "Atlas",
     kind: "builtin",
+    builtinKind: "atlas",
     apiKeyHash: sha256(agentId),
   });
   await db.insert(writs).values({
@@ -376,7 +409,7 @@ for (const driver of drivers) {
       await db.insert(disputes).values({ id: newRowId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" });
       await expect(
         db.insert(disputes).values({ id: newRowId("dispute"), tenantId: TENANT, paypalDisputeId, status: "OPEN" }),
-      ).rejects.toSatisfy((e: unknown) => isUniqueViolation(e, "disputes_paypal_dispute_id_unique"));
+      ).rejects.toSatisfy((e: unknown) => isUniqueViolation(e, "disputes_live_paypal_id_idx"));
 
       // Webhook dedupe (plan §6.8): the redelivery inserts nothing.
       const event = { paypalEventId: `WH-${newRowId("outbox")}`, tenantId: TENANT, type: "PAYMENT.CAPTURE.COMPLETED", payload: {} };
@@ -384,6 +417,42 @@ for (const driver of drivers) {
       const redelivery = await db.insert(webhookEvents).values(event).onConflictDoNothing().returning();
       expect(firstInsert).toHaveLength(1);
       expect(redelivery).toHaveLength(0);
+    });
+
+    it("enforces the contract constraints added for the parallel build", async () => {
+      const f = await seed(db);
+      // A built-in agent names its reference agent; any other kind must not.
+      const builtin = { tenantId: TENANT, userId: f.userId, name: "Atlas", kind: "builtin" as const, apiKeyHash: sha256(newRowId("agent")) };
+      await expect(db.insert(agents).values({ id: newRowId("agent"), ...builtin })).rejects.toSatisfy((e: unknown) =>
+        isCheckViolation(e, "agents_builtin_kind_presence_check"),
+      );
+      await expect(db.insert(agents).values({ id: newRowId("agent"), ...builtin, builtinKind: "atlas" })).resolves.toBeDefined();
+      await expect(
+        db.insert(agents).values({ id: newRowId("agent"), ...builtin, kind: "sdk", builtinKind: "scout", apiKeyHash: sha256(newRowId("agent")) }),
+      ).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "agents_builtin_kind_presence_check"));
+
+      // An ACTIVE vault token always has a vault id; a PENDING one may not yet.
+      const vault = { tenantId: TENANT, userId: f.userId };
+      await expect(db.insert(paypalVaultTokens).values({ id: newRowId("vaultToken"), ...vault, status: "ACTIVE" })).rejects.toSatisfy(
+        (e: unknown) => isCheckViolation(e, "paypal_vault_tokens_active_vault_check"),
+      );
+      await expect(
+        db.insert(paypalVaultTokens).values({ id: newRowId("vaultToken"), ...vault, status: "PENDING", setupTokenId: newRowId("vaultToken") }),
+      ).resolves.toBeDefined();
+
+      // Decision stages are a closed list; one approval per purchase.
+      const bogusStage = db.execute(
+        sql`insert into decisions (id, tenant_id, cart_id, stage, verdict) values (${newRowId("decision")}, ${TENANT}, ${f.cartId}, 'vibes', 'APPROVE')`,
+      );
+      await expect(bogusStage).rejects.toSatisfy((e: unknown) => isCheckViolation(e, "decisions_stage_check"));
+      await expect(db.insert(decisions).values({ id: newRowId("decision"), tenantId: TENANT, cartId: f.cartId, stage: "preview", verdict: "BLOCK" })).resolves.toBeDefined();
+      const purchaseId = newRowId("purchase");
+      await db.insert(purchases).values(purchaseRow(f, { id: purchaseId, state: "AWAITING_HUMAN" }));
+      const approval = { tenantId: TENANT, purchaseId, status: "PENDING" as const, request: {}, expiresAt: new Date(Date.now() + 86_400_000) };
+      await db.insert(approvals).values({ id: newRowId("approval"), ...approval });
+      await expect(db.insert(approvals).values({ id: newRowId("approval"), ...approval })).rejects.toSatisfy((e: unknown) =>
+        isUniqueViolation(e, "approvals_purchase_unique"),
+      );
     });
 
     it("rejects an agent kind outside ('builtin','mcp','sdk')", async () => {
@@ -401,6 +470,17 @@ describe("schema constants", () => {
   it("keeps the CHECK lists in sync with @writ/core", () => {
     expect([...CURRENCIES]).toEqual(CurrencySchema.options);
     expect([...WRIT_STATUSES]).toEqual([...CORE_WRIT_STATUSES]);
+    expect([...PURCHASE_STATES]).toEqual([...CORE_PURCHASE_STATES]);
+    expect([...PURCHASE_STATE_REASONS]).toEqual([...CORE_PURCHASE_STATE_REASONS]);
+    expect([...DECISION_RECORD_STAGES]).toEqual([...CORE_DECISION_RECORD_STAGES]);
+    expect([...APPROVAL_STATUSES]).toEqual([...CORE_APPROVAL_STATUSES]);
+    expect([...APPROVAL_DECISIONS]).toEqual([...CORE_APPROVAL_DECISIONS]);
+    expect([...CATALOG_SOURCES]).toEqual([...CORE_CATALOG_SOURCES]);
+    expect([...AGENT_KINDS]).toEqual([...CORE_AGENT_KINDS]);
+    expect([...BUILTIN_AGENT_KINDS]).toEqual([...CORE_BUILTIN_AGENT_KINDS]);
+    expect([...RUN_STATUSES]).toEqual([...CORE_RUN_STATUSES]);
+    expect([...RUN_MODES]).toEqual([...CORE_RUN_MODES]);
+    expect([...VAULT_TOKEN_STATUSES]).toEqual([...CORE_VAULT_TOKEN_STATUSES]);
   });
 
   it("mints ids that @writ/core contracts accept for every row a signed document references", () => {
@@ -420,15 +500,28 @@ describe("schema constants", () => {
   it("gives every row kind a distinct prefix and a unique, time-ordered ULID body", () => {
     const kinds = Object.keys(ROW_ID_PREFIXES) as (keyof typeof ROW_ID_PREFIXES)[];
     expect(new Set(Object.values(ROW_ID_PREFIXES)).size).toBe(kinds.length);
+    // Every check runs on every id, but mismatches are collected and asserted once: one expect()
+    // per check is kinds × 200 × kinds calls (~76 000 with 19 kinds), seconds on a busy machine.
+    const perKind = 200;
+    const problems: string[] = [];
+    let crossChecks = 0;
     for (const kind of kinds) {
-      const ids = new Set(Array.from({ length: 200 }, () => newRowId(kind)));
-      expect(ids.size).toBe(200);
+      const shape = new RegExp(`^${ROW_ID_PREFIXES[kind]}_[0-7][0-9a-hjkmnp-tv-z]{25}$`);
+      const ids = new Set(Array.from({ length: perKind }, () => newRowId(kind)));
+      if (ids.size !== perKind) problems.push(`${kind}: ${perKind - ids.size} duplicate id(s) in ${perKind}`);
       for (const id of ids) {
-        expect(id).toMatch(new RegExp(`^${ROW_ID_PREFIXES[kind]}_[0-7][0-9a-hjkmnp-tv-z]{25}$`));
-        expect(isRowId(kind, id)).toBe(true);
-        for (const other of kinds) if (other !== kind) expect(isRowId(other, id), `${id} as ${other}`).toBe(false);
+        if (!shape.test(id)) problems.push(`${id} does not match ${shape.source}`);
+        if (!isRowId(kind, id)) problems.push(`${id} is not accepted as ${kind}`);
+        for (const other of kinds) {
+          if (other === kind) continue;
+          crossChecks += 1;
+          if (isRowId(other, id)) problems.push(`${id} is also accepted as ${other}`);
+        }
       }
     }
+    expect(problems).toEqual([]);
+    // Every id was checked against every other kind.
+    expect(crossChecks).toBe(kinds.length * perKind * (kinds.length - 1));
     const early = newRowId("outbox", () => Date.parse("2026-11-01T00:00:00.000Z"));
     const late = newRowId("outbox", () => Date.parse("2026-11-02T00:00:00.000Z"));
     expect(early < late).toBe(true);
