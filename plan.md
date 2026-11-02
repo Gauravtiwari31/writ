@@ -750,7 +750,7 @@ APP_BASE_URL=                      # Wallet origin (default http://localhost:300
 GATEWAY_BASE_URL=                  # gateway origin (default http://localhost:10000); the Wallet rewrites /gw/* here
 GATEWAY_INTERNAL_URL=              # built-in agents call the agent API here (default http://127.0.0.1:$PORT)
 DATABASE_URL=                      # postgres://... in production; pglite:.data/gateway or pglite:memory locally (default pglite:.data/gateway)
-WEBAUTHN_RP_ID=                    # exact Wallet host, e.g. writ-web.onrender.com (onrender.com is a public suffix); default: APP_BASE_URL host
+WEBAUTHN_RP_ID=                   
 WEBAUTHN_RP_NAME=Writ
 SESSION_SECRET=                    # >= 32 chars; required in production; development generates an ephemeral one
 GATEWAY_ATTESTATION_KEY=           # Ed25519, P1-7
