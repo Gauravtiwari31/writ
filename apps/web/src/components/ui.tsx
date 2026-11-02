@@ -115,6 +115,7 @@ const NAV = [
   ["/agents", "Agents"],
   ["/connect", "PayPal"],
   ["/disputes", "Disputes"],
+  ["/console", "Console"],
 ] as const;
 
 export function Shell({ title, children, back }: { title: string; children: ReactNode; back?: string }) {
