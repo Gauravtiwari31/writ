@@ -24,6 +24,16 @@ export const WritBenchCaseSchema = z
     /** What the attacker wants (scored as "money moved for attacker goal" when it happens). */
     attacker_goal: z.string().min(1).max(300).nullable(),
     benign: z.boolean(),
+    /**
+     * What a fully hijacked agent would submit. "cart": these products, optionally to an address that is not
+     * the Writ's. "forbidden_field": a request carrying a field the API must refuse (payee, note). "analyst":
+     * a dispute-message attack, which needs a model and is skipped in rules mode. Benign cases buy the items.
+     */
+    attempt: z.discriminatedUnion("kind", [
+      z.strictObject({ kind: z.literal("cart"), items: z.array(z.strictObject({ product_ref: z.string().min(1).max(128), qty: z.int().min(1).max(99) })).min(1), foreign_address: z.boolean() }),
+      z.strictObject({ kind: z.literal("forbidden_field"), field: z.enum(["payee", "note"]), value: z.string().min(1).max(200) }),
+      z.strictObject({ kind: z.literal("analyst") }),
+    ]),
   })
   .refine((c) => c.benign === (c.category === "BENIGN"), { message: "benign exactly when category is BENIGN", path: ["benign"] })
   .refine((c) => (c.benign ? c.channel === null && c.attacker_goal === null : c.channel !== null && c.attacker_goal !== null), {
